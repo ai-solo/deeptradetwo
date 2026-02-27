@@ -30,12 +30,12 @@ var (
 	flagOptimize   = flag.Bool("optimize", false, "启用优化模式 (Int32+Zstd压缩，需MySQL)")
 	flagForceInt32 = flag.Bool("force-int32", false, "强制Int32模式 (不检测超限，有溢出风险)")
 	// OSS 相关参数
-	flagOSS            = flag.Bool("oss", false, "启用阿里云 OSS 上传")
-	flagOSSAccessKey   = flag.String("oss-access-key", "", "OSS AccessKey ID (默认从环境变量读取)")
-	flagOSSSecretKey   = flag.String("oss-secret-key", "", "OSS AccessKey Secret (默认从环境变量读取)")
-	flagOSSEndpoint   = flag.String("oss-endpoint", "", "OSS Endpoint (默认: oss-cn-shanghai.aliyuncs.com)")
-	flagOSSBucket     = flag.String("oss-bucket", "", "OSS Bucket 名称 (默认: stock-data)")
-	flagOSSBasePath   = flag.String("oss-path", "", "OSS 存储路径前缀 (默认: market_data)")
+	flagOSS          = flag.Bool("oss", false, "启用阿里云 OSS 上传")
+	flagOSSAccessKey = flag.String("oss-access-key", "", "OSS AccessKey ID (默认从环境变量读取)")
+	flagOSSSecretKey = flag.String("oss-secret-key", "", "OSS AccessKey Secret (默认从环境变量读取)")
+	flagOSSEndpoint  = flag.String("oss-endpoint", "", "OSS Endpoint (默认: oss-cn-shanghai.aliyuncs.com)")
+	flagOSSBucket    = flag.String("oss-bucket", "", "OSS Bucket 名称 (默认: stock-data)")
+	flagOSSBasePath  = flag.String("oss-path", "", "OSS 存储路径前缀 (默认: market_data)")
 )
 
 func main() {
@@ -270,11 +270,15 @@ func parseTradingDay(s string) (time.Time, error) {
 
 // findDataFile 查找数据文件
 func findDataFile(baseDir, datePath, filename string) string {
+	// 从文件名中提取日期前缀（YYYYMMDD）
+	datePrefix := strings.Split(filename, "_")[0]
+	
 	// 尝试多种路径
 	paths := []string{
-		filepath.Join(baseDir, datePath, filename),
-		filepath.Join(baseDir, filename),
-		filepath.Join(baseDir, "datayes", datePath, filename),
+		filepath.Join(baseDir, datePrefix, filename),       // ./20251231/20251231_xxx.csv.zip
+		filepath.Join(baseDir, datePath, filename),         // ./2025/2025.12/20251231/20251231_xxx.csv.zip
+		filepath.Join(baseDir, filename),                   // ./20251231_xxx.csv.zip
+		filepath.Join(baseDir, "datayes", datePath, filename), // ./datayes/2025/2025.12/20251231/20251231_xxx.csv.zip
 	}
 
 	for _, p := range paths {
