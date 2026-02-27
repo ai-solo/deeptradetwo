@@ -210,48 +210,48 @@ func (p *Processor) ProcessSHOrderDeal(zipPath string) (*ProcessResult, error) {
 				defer wg.Done()
 				defer func() { <-sem }()
 
-				orders, deals, err := p.converter.ConvertSHOrderDeal(recs)
-				if err != nil {
-					atomic.AddInt64(&result.ErrorCount, 1)
-					return
-				}
+			orders, deals, err := p.converter.ConvertSHOrderDeal(recs)
+			if err != nil {
+				atomic.AddInt64(&result.ErrorCount, 1)
+				return
+			}
 
-				// 验证和统计
-				validOrders := 0
-				for _, o := range orders {
-					if ValidateOrder(o) {
-						validOrders++
-					}
+			// 验证和过滤
+			validOrders := make([]Order, 0, len(orders))
+			for _, o := range orders {
+				if ValidateOrder(o) {
+					validOrders = append(validOrders, o)
 				}
+			}
 
-				validDeals := 0
-				for _, d := range deals {
-					if ValidateDeal(d) {
-						validDeals++
-					}
+			validDeals := make([]Deal, 0, len(deals))
+			for _, d := range deals {
+				if ValidateDeal(d) {
+					validDeals = append(validDeals, d)
 				}
+			}
 
-			atomic.AddInt64(&orderCount, int64(validOrders))
-			atomic.AddInt64(&dealCount, int64(validDeals))
+			atomic.AddInt64(&orderCount, int64(len(validOrders)))
+			atomic.AddInt64(&dealCount, int64(len(validDeals)))
 
 			// 写入缓存（根据模式选择不同的 Writer）
-			if len(orders) > 0 {
+			if len(validOrders) > 0 {
 				var err error
 				if p.optMode {
-					err = p.optParquetWriter.WriteOrders(orders)
+					err = p.optParquetWriter.WriteOrders(validOrders)
 				} else {
-					err = p.parquetWriter.WriteOrders(orders)
+					err = p.parquetWriter.WriteOrders(validOrders)
 				}
 				if err != nil {
 					log.Printf("[错误] 写入委托失败: %v", err)
 				}
 			}
-			if len(deals) > 0 {
+			if len(validDeals) > 0 {
 				var err error
 				if p.optMode {
-					err = p.optParquetWriter.WriteDeals(deals)
+					err = p.optParquetWriter.WriteDeals(validDeals)
 				} else {
-					err = p.parquetWriter.WriteDeals(deals)
+					err = p.parquetWriter.WriteDeals(validDeals)
 				}
 				if err != nil {
 					log.Printf("[错误] 写入成交失败: %v", err)
@@ -504,27 +504,28 @@ func (p *Processor) ProcessSZOrder(zipPath string) (*ProcessResult, error) {
 				defer wg.Done()
 				defer func() { <-sem }()
 
-				orders, err := p.converter.ConvertSZOrder(recs)
-				if err != nil {
-					atomic.AddInt64(&result.ErrorCount, 1)
-					return
-				}
+			orders, err := p.converter.ConvertSZOrder(recs)
+			if err != nil {
+				atomic.AddInt64(&result.ErrorCount, 1)
+				return
+			}
 
-				validCount := 0
-				for _, o := range orders {
-					if ValidateOrder(o) {
-						validCount++
-					}
+			// 验证和过滤
+			validOrders := make([]Order, 0, len(orders))
+			for _, o := range orders {
+				if ValidateOrder(o) {
+					validOrders = append(validOrders, o)
 				}
-			atomic.AddInt64(&result.ValidRows, int64(validCount))
+			}
+			atomic.AddInt64(&result.ValidRows, int64(len(validOrders)))
 
 			// 写入缓存（根据模式选择不同的 Writer）
-			if len(orders) > 0 {
+			if len(validOrders) > 0 {
 				var err error
 				if p.optMode {
-					err = p.optParquetWriter.WriteOrders(orders)
+					err = p.optParquetWriter.WriteOrders(validOrders)
 				} else {
-					err = p.parquetWriter.WriteOrders(orders)
+					err = p.parquetWriter.WriteOrders(validOrders)
 				}
 				if err != nil {
 					log.Printf("[错误] 写入委托失败: %v", err)
@@ -633,27 +634,28 @@ func (p *Processor) ProcessSZDeal(zipPath string) (*ProcessResult, error) {
 				defer wg.Done()
 				defer func() { <-sem }()
 
-				deals, err := p.converter.ConvertSZDeal(recs)
-				if err != nil {
-					atomic.AddInt64(&result.ErrorCount, 1)
-					return
-				}
+			deals, err := p.converter.ConvertSZDeal(recs)
+			if err != nil {
+				atomic.AddInt64(&result.ErrorCount, 1)
+				return
+			}
 
-				validCount := 0
-				for _, d := range deals {
-					if ValidateDeal(d) {
-						validCount++
-					}
+			// 验证和过滤
+			validDeals := make([]Deal, 0, len(deals))
+			for _, d := range deals {
+				if ValidateDeal(d) {
+					validDeals = append(validDeals, d)
 				}
-			atomic.AddInt64(&result.ValidRows, int64(validCount))
+			}
+			atomic.AddInt64(&result.ValidRows, int64(len(validDeals)))
 
 			// 写入缓存（根据模式选择不同的 Writer）
-			if len(deals) > 0 {
+			if len(validDeals) > 0 {
 				var err error
 				if p.optMode {
-					err = p.optParquetWriter.WriteDeals(deals)
+					err = p.optParquetWriter.WriteDeals(validDeals)
 				} else {
-					err = p.parquetWriter.WriteDeals(deals)
+					err = p.parquetWriter.WriteDeals(validDeals)
 				}
 				if err != nil {
 					log.Printf("[错误] 写入成交失败: %v", err)

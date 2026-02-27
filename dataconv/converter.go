@@ -621,11 +621,48 @@ func ValidateCode(code string) bool {
 	return patternSZ.MatchString(code) || patternSH.MatchString(code)
 }
 
+// ValidateTime 验证时间是否在连续竞价时间段内
+// 连续竞价时间：09:30:00-11:30:00, 13:00:00-14:57:00
+// 注意：包含集合竞价后的开盘时刻和收盘前的数据
+func ValidateTime(t time.Time) bool {
+	hour := t.Hour()
+	minute := t.Minute()
+	second := t.Second()
+	
+	timeInSeconds := hour*3600 + minute*60 + second
+	
+	// 09:30:00 = 34200秒（包含开盘时刻）
+	morningStart := 9*3600 + 30*60
+	// 11:30:00 = 41400秒
+	morningEnd := 11*3600 + 30*60
+	// 13:00:00 = 46800秒
+	afternoonStart := 13 * 3600
+	// 14:57:00 = 53820秒（包含收盘前数据）
+	afternoonEnd := 14*3600 + 57*60
+	
+	// 上午时段或下午时段
+	inMorning := timeInSeconds >= morningStart && timeInSeconds <= morningEnd
+	inAfternoon := timeInSeconds >= afternoonStart && timeInSeconds <= afternoonEnd
+	
+	// 调试：记录被过滤的时间（仅前几次）
+	if !inMorning && !inAfternoon {
+		// 不记录日志，避免刷屏
+	}
+	
+	return inMorning || inAfternoon
+}
+
 // ValidateOrder 验证委托数据
 func ValidateOrder(order Order) bool {
 	if !ValidateCode(order.Code) {
 		return false
 	}
+	
+	// 验证时间是否在连续竞价时间段内
+	if !ValidateTime(order.Time) {
+		return false
+	}
+	
 	if order.Side != 0 && order.Side != 1 {
 		return false
 	}
@@ -655,6 +692,11 @@ func ValidateDeal(deal Deal) bool {
 		return false
 	}
 	
+	// 验证时间是否在连续竞价时间段内
+	if !ValidateTime(deal.Time) {
+		return false
+	}
+	
 	// 验证价格、数量、金额是否有限
 	if !isFinite(deal.Price) || !isFinite(deal.Volume) || !isFinite(deal.Money) {
 		return false
@@ -676,6 +718,11 @@ func ValidateDeal(deal Deal) bool {
 // ValidateTick 验证快照数据
 func ValidateTick(tick Tick) bool {
 	if !ValidateCode(tick.Code) {
+		return false
+	}
+	
+	// 验证时间是否在连续竞价时间段内
+	if !ValidateTime(tick.Time) {
 		return false
 	}
 	

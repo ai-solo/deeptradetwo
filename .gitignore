@@ -13,6 +13,5 @@ nohup.out
 deeptrade
 *.config.toml
 ./conf/config.toml
-20251201
+20251202
 output
-/20251201/
