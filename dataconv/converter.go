@@ -2,6 +2,7 @@ package dataconv
 
 import (
 	"fmt"
+	"log"
 	"math"
 	"regexp"
 	"strconv"
@@ -26,14 +27,18 @@ func GetMarket(code string) Market {
 	}
 	firstChar := code[0]
 	switch firstChar {
-	case '5', '6': // 5开头是上交所基金/债券，6开头是上交所股票
+	case '0', '1', '3', '4': // 深交所
+		return MarketSZ
+	case '2': // 深交所B股/中小板
+		return MarketSZ
+	case '5', '6': // 上交所
 		return MarketSH
-	case '0', '3': // 0开头是深交所主板，3开头是深交所创业板
-		return MarketSZ
-	case '4': // 4开头是深交所转债
-		return MarketSZ
-	case '1': // 1开头是深交所基金
-		return MarketSZ
+	case '7': // 上交所新股申购/B股
+		return MarketSH
+	case '8': // 北交所
+		return MarketSH
+	case '9': // 科创板/上交所
+		return MarketSH
 	default:
 		return ""
 	}
@@ -264,9 +269,20 @@ func (c *Converter) ConvertSHOrderDeal(records []map[string]string) ([]Order, []
 // 数据格式: MarketData
 func (c *Converter) ConvertSHTick(records []map[string]string, highLimit, lowLimit float64) ([]Tick, error) {
 	var ticks []Tick
+	skippedCount := 0
 
 	for _, r := range records {
-		securityID, _ := strconv.ParseInt(r["SecurityID"], 10, 64)
+		securityID, err := strconv.ParseInt(r["SecurityID"], 10, 64)
+		if err != nil || securityID <= 0 {
+			skippedCount++
+			if err != nil {
+				// 记录原始数据格式问题（比如带小数点）
+				if skippedCount <= 5 {
+					log.Printf("[跳过] 无效 SecurityID: '%s' (错误: %v)", r["SecurityID"], err)
+				}
+			}
+			continue
+		}
 		code := FormatCode(int(securityID))
 
 		updateTime, err := ParseTime(r["UpdateTime"], c.tradingDay)
@@ -314,6 +330,10 @@ func (c *Converter) ConvertSHTick(records []map[string]string, highLimit, lowLim
 		ticks = append(ticks, tick)
 	}
 
+	if skippedCount > 0 {
+		log.Printf("[统计] 上交所快照跳过 %d 条无效 SecurityID 记录", skippedCount)
+	}
+
 	return ticks, nil
 }
 
@@ -323,9 +343,19 @@ func (c *Converter) ConvertSHTick(records []map[string]string, highLimit, lowLim
 // 数据格式: mdl_6_33_0
 func (c *Converter) ConvertSZOrder(records []map[string]string) ([]Order, error) {
 	var orders []Order
+	skippedCount := 0
 
 	for _, r := range records {
-		securityID, _ := strconv.ParseInt(r["SecurityID"], 10, 64)
+		securityID, err := strconv.ParseInt(r["SecurityID"], 10, 64)
+		if err != nil || securityID <= 0 {
+			skippedCount++
+			if err != nil {
+				if skippedCount <= 5 {
+					log.Printf("[跳过] 无效 SecurityID: '%s' (错误: %v)", r["SecurityID"], err)
+				}
+			}
+			continue
+		}
 		code := FormatCode(int(securityID))
 
 		transactTime, err := ParseTime(r["TransactTime"], c.tradingDay)
@@ -368,6 +398,10 @@ func (c *Converter) ConvertSZOrder(records []map[string]string) ([]Order, error)
 		orders = append(orders, order)
 	}
 
+	if skippedCount > 0 {
+		log.Printf("[统计] 深交所委托跳过 %d 条无效 SecurityID 记录", skippedCount)
+	}
+
 	return orders, nil
 }
 
@@ -375,9 +409,19 @@ func (c *Converter) ConvertSZOrder(records []map[string]string) ([]Order, error)
 // 数据格式: mdl_6_36_0
 func (c *Converter) ConvertSZDeal(records []map[string]string) ([]Deal, error) {
 	var deals []Deal
+	skippedCount := 0
 
 	for _, r := range records {
-		securityID, _ := strconv.ParseInt(r["SecurityID"], 10, 64)
+		securityID, err := strconv.ParseInt(r["SecurityID"], 10, 64)
+		if err != nil || securityID <= 0 {
+			skippedCount++
+			if err != nil {
+				if skippedCount <= 5 {
+					log.Printf("[跳过] 无效 SecurityID: '%s' (错误: %v)", r["SecurityID"], err)
+				}
+			}
+			continue
+		}
 		code := FormatCode(int(securityID))
 
 		transactTime, err := ParseTime(r["TransactTime"], c.tradingDay)
@@ -421,6 +465,10 @@ func (c *Converter) ConvertSZDeal(records []map[string]string) ([]Deal, error) {
 		deals = append(deals, deal)
 	}
 
+	if skippedCount > 0 {
+		log.Printf("[统计] 深交所成交跳过 %d 条无效 SecurityID 记录", skippedCount)
+	}
+
 	return deals, nil
 }
 
@@ -428,9 +476,20 @@ func (c *Converter) ConvertSZDeal(records []map[string]string) ([]Deal, error) {
 // 数据格式: mdl_6_28_0
 func (c *Converter) ConvertSZTick(records []map[string]string, highLimit, lowLimit float64) ([]Tick, error) {
 	var ticks []Tick
+	skippedCount := 0
 
 	for _, r := range records {
-		securityID, _ := strconv.ParseInt(r["SecurityID"], 10, 64)
+		securityID, err := strconv.ParseInt(r["SecurityID"], 10, 64)
+		if err != nil || securityID <= 0 {
+			skippedCount++
+			if err != nil {
+				// 记录原始数据格式问题（比如带小数点）
+				if skippedCount <= 5 {
+					log.Printf("[跳过] 无效 SecurityID: '%s' (错误: %v)", r["SecurityID"], err)
+				}
+			}
+			continue
+		}
 		code := FormatCode(int(securityID))
 
 		updateTime, err := ParseTime(r["UpdateTime"], c.tradingDay)
@@ -478,6 +537,10 @@ func (c *Converter) ConvertSZTick(records []map[string]string, highLimit, lowLim
 		ticks = append(ticks, tick)
 	}
 
+	if skippedCount > 0 {
+		log.Printf("[统计] 深交所快照跳过 %d 条无效 SecurityID 记录", skippedCount)
+	}
+
 	return ticks, nil
 }
 
@@ -519,19 +582,42 @@ func setTickLevel(tick *Tick, level int, bidPrice, bidVolume, bidNum, askPrice, 
 }
 
 func parseInt64(s string) int64 {
-	val, _ := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+	
+	// 处理浮点数格式 (如 "200596." 或 "200596.0")
+	if idx := strings.IndexByte(s, '.'); idx != -1 {
+		s = s[:idx]
+	}
+	
+	val, _ := strconv.ParseInt(s, 10, 64)
 	return val
 }
 
 func parseFloat64(s string) float64 {
-	val, _ := strconv.ParseFloat(strings.TrimSpace(s), 64)
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+	val, _ := strconv.ParseFloat(s, 64)
 	return val
 }
 
-// ValidateCode 验证股票代码格式
+// ValidateCode 验证股票代码格式（仅股票，不含基金债券）
 func ValidateCode(code string) bool {
-	patternSZ := regexp.MustCompile(`^[03]\d{5}\.XSHE$`)
-	patternSH := regexp.MustCompile(`^[6]\d{5}\.XSHG$`)
+	// 深交所股票：
+	//   0 = 主板（000001-002999）
+	//   2 = B股/中小板（200001-204999）
+	//   3 = 创业板（300001-309999）
+	patternSZ := regexp.MustCompile(`^[023]\d{5}\.XSHE$`)
+	
+	// 上交所股票：
+	//   6 = 主板股票（600000-699999，含科创板688XXX）
+	//   9 = B股（900XXX）
+	patternSH := regexp.MustCompile(`^[69]\d{5}\.XSHG$`)
+	
 	return patternSZ.MatchString(code) || patternSH.MatchString(code)
 }
 

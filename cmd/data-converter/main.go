@@ -27,6 +27,15 @@ var (
 	flagDataPrefix = flag.String("prefix", "", "数据文件路径前缀 (可选)")
 	flagNoMySQL    = flag.Bool("no-mysql", false, "不使用MySQL (涨跌停价格将为0)")
 	flagLimit      = flag.Int("limit", 0, "限制处理行数 (0表示不限制，用于测试)")
+	flagOptimize   = flag.Bool("optimize", false, "启用优化模式 (Int32+Zstd压缩，需MySQL)")
+	flagForceInt32 = flag.Bool("force-int32", false, "强制Int32模式 (不检测超限，有溢出风险)")
+	// OSS 相关参数
+	flagOSS            = flag.Bool("oss", false, "启用阿里云 OSS 上传")
+	flagOSSAccessKey   = flag.String("oss-access-key", "", "OSS AccessKey ID (默认从环境变量读取)")
+	flagOSSSecretKey   = flag.String("oss-secret-key", "", "OSS AccessKey Secret (默认从环境变量读取)")
+	flagOSSEndpoint   = flag.String("oss-endpoint", "", "OSS Endpoint (默认: oss-cn-shanghai.aliyuncs.com)")
+	flagOSSBucket     = flag.String("oss-bucket", "", "OSS Bucket 名称 (默认: stock-data)")
+	flagOSSBasePath   = flag.String("oss-path", "", "OSS 存储路径前缀 (默认: market_data)")
 )
 
 func main() {
@@ -54,8 +63,10 @@ func main() {
 		cpuCount := runtime.NumCPU()
 		if cpuCount <= 2 {
 			workers = 1 // 2核或以下使用单线程，避免OOM
+		} else if cpuCount <= 4 {
+			workers = 2 // 4核以下使用2线程
 		} else {
-			workers = cpuCount / 2 // 多核环境使用一半核心数
+			workers = cpuCount / 3 // 多核环境更保守的并发数
 		}
 	}
 	log.Printf("[配置] 并发数: %d (CPU核心数: %d)", workers, runtime.NumCPU())
@@ -83,6 +94,42 @@ func main() {
 		}
 	}
 
+	// 配置 OSS（如果启用）
+	var ossConfig *dataconv.OSSConfig
+	if *flagOSS || *flagOSSAccessKey != "" {
+		ossConfig = &dataconv.OSSConfig{
+			AccessKeyID:     *flagOSSAccessKey,
+			AccessKeySecret: *flagOSSSecretKey,
+			Endpoint:        *flagOSSEndpoint,
+			BucketName:      *flagOSSBucket,
+			BasePath:        *flagOSSBasePath,
+		}
+		if *flagOSS {
+			log.Println("========================================")
+			log.Println("[OSS] OSS 上传已启用")
+			if *flagOSSAccessKey != "" {
+				accessKeyLen := len(*flagOSSAccessKey)
+				if accessKeyLen > 8 {
+					log.Printf("  - AccessKey: %s***", (*flagOSSAccessKey)[:8])
+				} else {
+					log.Printf("  - AccessKey: %s***", *flagOSSAccessKey)
+				}
+			} else {
+				log.Println("  - AccessKey: 从环境变量读取")
+			}
+			if *flagOSSEndpoint != "" {
+				log.Printf("  - Endpoint: %s", *flagOSSEndpoint)
+			}
+			if *flagOSSBucket != "" {
+				log.Printf("  - Bucket: %s", *flagOSSBucket)
+			}
+			if *flagOSSBasePath != "" {
+				log.Printf("  - BasePath: %s", *flagOSSBasePath)
+			}
+			log.Println("========================================")
+		}
+	}
+
 	// 创建处理器
 	processor, err := dataconv.NewProcessor(dataconv.ProcessorConfig{
 		TradingDay:  tradingDay,
@@ -90,6 +137,9 @@ func main() {
 		Workers:     workers,
 		ZipPassword: *flagPassword,
 		RowLimit:    *flagLimit,
+		Optimize:    *flagOptimize,
+		ForceInt32:  *flagForceInt32,
+		OSSConfig:   ossConfig,
 	})
 	if err != nil {
 		log.Fatalf("创建处理器失败: %v", err)

@@ -14,10 +14,10 @@ import (
 )
 
 const (
-	// 快照数据使用较小的分块大小（优化为10万条，适合2GB内存）
-	chunkSizeTick = 100_000
-	// 其他数据使用中等分块大小（优化为50万条，避免OOM）
-	chunkSizeNormal = 500_000
+	// 快照数据使用较小的分块大小（2核2G优化：1万条/批）
+	chunkSizeTick = 10_000
+	// 其他数据使用中等分块大小（2核2G优化：5万条/批）
+	chunkSizeNormal = 50_000
 )
 
 // ZipReader ZIP文件读取器

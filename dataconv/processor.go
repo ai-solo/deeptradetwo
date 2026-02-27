@@ -8,17 +8,24 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"deeptrade/storage"
 )
 
 // Processor 数据处理器
 type Processor struct {
-	converter     *Converter
-	reader        *ZipReader
-	parquetWriter *ParquetWriter
-	priceRepo     *LimitPriceRepository
-	priceCache    *PriceCache
-	workers       int
-	rowLimit      int // 限制处理行数
+	converter        *Converter
+	reader           *ZipReader
+	parquetWriter    *ParquetWriter
+	optParquetWriter *OptParquetWriter // 优化模式写入器
+	priceRepo        *LimitPriceRepository
+	priceCache       *PriceCache
+	securityCache    *SecurityCache // 证券代码缓存
+	rangeChecker     *DataRangeChecker // 数据范围检查器
+	optMode          bool            // 是否启用优化模式
+	forceInt32       bool            // 强制使用 Int32（不检测）
+	workers          int
+	rowLimit         int // 限制处理行数
 }
 
 // ProcessorConfig 处理器配置
@@ -28,6 +35,9 @@ type ProcessorConfig struct {
 	Workers     int
 	ZipPassword string
 	RowLimit    int // 限制处理行数，0表示不限制
+	Optimize    bool // 是否启用优化模式
+	ForceInt32  bool // 强制使用 Int32（不检测，有溢出风险）
+	OSSConfig   *OSSConfig // OSS 配置（可选）
 }
 
 // NewProcessor 创建处理器
@@ -50,17 +60,64 @@ func NewProcessor(cfg ProcessorConfig) (*Processor, error) {
 		}
 	}
 
-	// 创建Parquet Writer（合并写入）
+	// 创建普通 Parquet Writer
 	parquetWriter := NewParquetWriter(cfg.OutputDir, cfg.TradingDay)
 
+	// 优化模式相关组件
+	var securityCache *SecurityCache
+	var rangeChecker *DataRangeChecker
+	var optParquetWriter *OptParquetWriter
+
+	if cfg.Optimize {
+		log.Println("========================================")
+		log.Println("[优化模式] 已启用")
+		log.Println("  - Code 使用 SECURITY_ID (Int32)")
+		log.Println("  - Price ×100 (Int32)")
+		log.Println("  - Volume ÷100 (Int32)")
+		log.Println("  - 删除冗余字段")
+		log.Println("  - 使用 Zstd 压缩")
+		if cfg.ForceInt32 {
+			log.Println("  - 强制 Int32 模式（不检测）")
+		} else {
+			log.Println("  - 实时检测超限")
+		}
+		log.Println("========================================")
+
+		// 获取 MySQL 客户端
+		gormDB, err := storage.GetMySQLClient()
+		if err != nil {
+			log.Printf("[错误] 优化模式需要数据库连接: %v", err)
+			return nil, fmt.Errorf("无法获取数据库连接: %w", err)
+		}
+		db, err := gormDB.DB()
+		if err != nil {
+			return nil, fmt.Errorf("获取 sql.DB 失败: %w", err)
+		}
+
+		// 创建证券代码缓存
+		securityCache = NewSecurityCache(db)
+
+		// 创建数据范围检查器
+		stopOnError := !cfg.ForceInt32 // 强制模式下不因超限停止
+		rangeChecker = NewDataRangeChecker(stopOnError)
+
+		// 创建优化后的写入器
+		optParquetWriter = NewOptParquetWriter(cfg.OutputDir, cfg.TradingDay, securityCache, rangeChecker, cfg.ForceInt32, cfg.OSSConfig)
+	}
+
 	return &Processor{
-		converter:     NewConverter(cfg.TradingDay),
-		reader:        NewZipReader(cfg.ZipPassword),
-		parquetWriter: parquetWriter,
-		priceRepo:     priceRepo,
-		priceCache:    priceCache,
-		workers:       cfg.Workers,
-		rowLimit:      cfg.RowLimit,
+		converter:        NewConverter(cfg.TradingDay),
+		reader:           NewZipReader(cfg.ZipPassword),
+		parquetWriter:    parquetWriter,
+		optParquetWriter: optParquetWriter,
+		priceRepo:        priceRepo,
+		priceCache:       priceCache,
+		securityCache:    securityCache,
+		rangeChecker:     rangeChecker,
+		optMode:          cfg.Optimize,
+		forceInt32:       cfg.ForceInt32,
+		workers:          cfg.Workers,
+		rowLimit:         cfg.RowLimit,
 	}, nil
 }
 
@@ -116,6 +173,7 @@ func (p *Processor) ProcessSHOrderDeal(zipPath string) (*ProcessResult, error) {
 
 		// 本批数据按股票分组
 		codeGroups := make(map[string][]map[string]string)
+		uniqueSecurityIDs := make(map[string]struct{})
 		
 		for _, record := range chunk {
 			row := make(map[string]string)
@@ -127,7 +185,20 @@ func (p *Processor) ProcessSHOrderDeal(zipPath string) (*ProcessResult, error) {
 
 			securityID := row["SecurityID"]
 			codeGroups[securityID] = append(codeGroups[securityID], row)
+			uniqueSecurityIDs[securityID] = struct{}{}
 			atomic.AddInt64(&result.TotalRows, 1)
+		}
+
+		// 优化模式：批量预加载本批数据的 SECURITY_ID
+		if p.optMode && p.securityCache != nil && len(uniqueSecurityIDs) > 0 {
+			codes := make([]string, 0, len(uniqueSecurityIDs))
+			for sid := range uniqueSecurityIDs {
+				code := FormatCode(int(parseInt64(sid)))
+				codes = append(codes, code)
+			}
+			if err := p.securityCache.BatchLoad(codes); err != nil {
+				log.Printf("[警告] 批量预加载本批 %d 个证券失败: %v", len(codes), err)
+			}
 		}
 
 		// 处理本批数据
@@ -163,14 +234,26 @@ func (p *Processor) ProcessSHOrderDeal(zipPath string) (*ProcessResult, error) {
 			atomic.AddInt64(&orderCount, int64(validOrders))
 			atomic.AddInt64(&dealCount, int64(validDeals))
 
-			// 写入缓存
+			// 写入缓存（根据模式选择不同的 Writer）
 			if len(orders) > 0 {
-				if err := p.parquetWriter.WriteOrders(orders); err != nil {
+				var err error
+				if p.optMode {
+					err = p.optParquetWriter.WriteOrders(orders)
+				} else {
+					err = p.parquetWriter.WriteOrders(orders)
+				}
+				if err != nil {
 					log.Printf("[错误] 写入委托失败: %v", err)
 				}
 			}
 			if len(deals) > 0 {
-				if err := p.parquetWriter.WriteDeals(deals); err != nil {
+				var err error
+				if p.optMode {
+					err = p.optParquetWriter.WriteDeals(deals)
+				} else {
+					err = p.parquetWriter.WriteDeals(deals)
+				}
+				if err != nil {
 					log.Printf("[错误] 写入成交失败: %v", err)
 				}
 			}
@@ -242,6 +325,7 @@ func (p *Processor) ProcessSHTick(zipPath string) (*ProcessResult, error) {
 
 		// 本批数据按股票分组
 		codeGroups := make(map[string][]map[string]string)
+		uniqueSecurityIDs := make(map[string]struct{})
 		
 		for _, record := range chunk {
 			row := make(map[string]string)
@@ -253,7 +337,20 @@ func (p *Processor) ProcessSHTick(zipPath string) (*ProcessResult, error) {
 
 			securityID := row["SecurityID"]
 			codeGroups[securityID] = append(codeGroups[securityID], row)
+			uniqueSecurityIDs[securityID] = struct{}{}
 			atomic.AddInt64(&result.TotalRows, 1)
+		}
+
+		// 优化模式：批量预加载本批数据的 SECURITY_ID
+		if p.optMode && p.securityCache != nil && len(uniqueSecurityIDs) > 0 {
+			codes := make([]string, 0, len(uniqueSecurityIDs))
+			for sid := range uniqueSecurityIDs {
+				code := FormatCode(int(parseInt64(sid)))
+				codes = append(codes, code)
+			}
+			if err := p.securityCache.BatchLoad(codes); err != nil {
+				log.Printf("[警告] 批量预加载本批 %d 个证券失败: %v", len(codes), err)
+			}
 		}
 
 		// 处理本批数据
@@ -291,10 +388,17 @@ func (p *Processor) ProcessSHTick(zipPath string) (*ProcessResult, error) {
 					return validTicks[i].SeqNum < validTicks[j].SeqNum
 				})
 
-			// 写入缓存
+			// 写入缓存（根据模式选择不同的 Writer）
 			if len(validTicks) > 0 {
-				if err := p.parquetWriter.WriteTicks(validTicks); err != nil {
+				var err error
+				if p.optMode {
+					err = p.optParquetWriter.WriteTicks(validTicks)
+				} else {
+					err = p.parquetWriter.WriteTicks(validTicks)
+				}
+				if err != nil {
 					log.Printf("[错误] 写入快照失败: %v", err)
+					return
 				}
 			}
 			}(securityID, records)
@@ -363,6 +467,7 @@ func (p *Processor) ProcessSZOrder(zipPath string) (*ProcessResult, error) {
 
 		// 本批数据按股票分组
 		codeGroups := make(map[string][]map[string]string)
+		uniqueSecurityIDs := make(map[string]struct{})
 		
 		for _, record := range chunk {
 			row := make(map[string]string)
@@ -374,7 +479,20 @@ func (p *Processor) ProcessSZOrder(zipPath string) (*ProcessResult, error) {
 
 			securityID := row["SecurityID"]
 			codeGroups[securityID] = append(codeGroups[securityID], row)
+			uniqueSecurityIDs[securityID] = struct{}{}
 			atomic.AddInt64(&result.TotalRows, 1)
+		}
+
+		// 优化模式：批量预加载本批数据的 SECURITY_ID
+		if p.optMode && p.securityCache != nil && len(uniqueSecurityIDs) > 0 {
+			codes := make([]string, 0, len(uniqueSecurityIDs))
+			for sid := range uniqueSecurityIDs {
+				code := FormatCode(int(parseInt64(sid)))
+				codes = append(codes, code)
+			}
+			if err := p.securityCache.BatchLoad(codes); err != nil {
+				log.Printf("[警告] 批量预加载本批 %d 个证券失败: %v", len(codes), err)
+			}
 		}
 
 		// 处理本批数据
@@ -400,8 +518,15 @@ func (p *Processor) ProcessSZOrder(zipPath string) (*ProcessResult, error) {
 				}
 			atomic.AddInt64(&result.ValidRows, int64(validCount))
 
+			// 写入缓存（根据模式选择不同的 Writer）
 			if len(orders) > 0 {
-				if err := p.parquetWriter.WriteOrders(orders); err != nil {
+				var err error
+				if p.optMode {
+					err = p.optParquetWriter.WriteOrders(orders)
+				} else {
+					err = p.parquetWriter.WriteOrders(orders)
+				}
+				if err != nil {
 					log.Printf("[错误] 写入委托失败: %v", err)
 				}
 			}
@@ -471,6 +596,7 @@ func (p *Processor) ProcessSZDeal(zipPath string) (*ProcessResult, error) {
 
 		// 本批数据按股票分组
 		codeGroups := make(map[string][]map[string]string)
+		uniqueSecurityIDs := make(map[string]struct{})
 		
 		for _, record := range chunk {
 			row := make(map[string]string)
@@ -482,7 +608,20 @@ func (p *Processor) ProcessSZDeal(zipPath string) (*ProcessResult, error) {
 
 			securityID := row["SecurityID"]
 			codeGroups[securityID] = append(codeGroups[securityID], row)
+			uniqueSecurityIDs[securityID] = struct{}{}
 			atomic.AddInt64(&result.TotalRows, 1)
+		}
+
+		// 优化模式：批量预加载本批数据的 SECURITY_ID
+		if p.optMode && p.securityCache != nil && len(uniqueSecurityIDs) > 0 {
+			codes := make([]string, 0, len(uniqueSecurityIDs))
+			for sid := range uniqueSecurityIDs {
+				code := FormatCode(int(parseInt64(sid)))
+				codes = append(codes, code)
+			}
+			if err := p.securityCache.BatchLoad(codes); err != nil {
+				log.Printf("[警告] 批量预加载本批 %d 个证券失败: %v", len(codes), err)
+			}
 		}
 
 		// 处理本批数据
@@ -508,8 +647,15 @@ func (p *Processor) ProcessSZDeal(zipPath string) (*ProcessResult, error) {
 				}
 			atomic.AddInt64(&result.ValidRows, int64(validCount))
 
+			// 写入缓存（根据模式选择不同的 Writer）
 			if len(deals) > 0 {
-				if err := p.parquetWriter.WriteDeals(deals); err != nil {
+				var err error
+				if p.optMode {
+					err = p.optParquetWriter.WriteDeals(deals)
+				} else {
+					err = p.parquetWriter.WriteDeals(deals)
+				}
+				if err != nil {
 					log.Printf("[错误] 写入成交失败: %v", err)
 				}
 			}
@@ -579,6 +725,7 @@ func (p *Processor) ProcessSZTick(zipPath string) (*ProcessResult, error) {
 
 		// 本批数据按股票分组
 		codeGroups := make(map[string][]map[string]string)
+		uniqueSecurityIDs := make(map[string]struct{})
 		
 		for _, record := range chunk {
 			row := make(map[string]string)
@@ -590,7 +737,20 @@ func (p *Processor) ProcessSZTick(zipPath string) (*ProcessResult, error) {
 
 			securityID := row["SecurityID"]
 			codeGroups[securityID] = append(codeGroups[securityID], row)
+			uniqueSecurityIDs[securityID] = struct{}{}
 			atomic.AddInt64(&result.TotalRows, 1)
+		}
+
+		// 优化模式：批量预加载本批数据的 SECURITY_ID
+		if p.optMode && p.securityCache != nil && len(uniqueSecurityIDs) > 0 {
+			codes := make([]string, 0, len(uniqueSecurityIDs))
+			for sid := range uniqueSecurityIDs {
+				code := FormatCode(int(parseInt64(sid)))
+				codes = append(codes, code)
+			}
+			if err := p.securityCache.BatchLoad(codes); err != nil {
+				log.Printf("[警告] 批量预加载本批 %d 个证券失败: %v", len(codes), err)
+			}
 		}
 
 		// 处理本批数据
@@ -628,9 +788,17 @@ func (p *Processor) ProcessSZTick(zipPath string) (*ProcessResult, error) {
 					return validTicks[i].SeqNum < validTicks[j].SeqNum
 				})
 
+			// 写入缓存（根据模式选择不同的 Writer）
 			if len(validTicks) > 0 {
-				if err := p.parquetWriter.WriteTicks(validTicks); err != nil {
+				var err error
+				if p.optMode {
+					err = p.optParquetWriter.WriteTicks(validTicks)
+				} else {
+					err = p.parquetWriter.WriteTicks(validTicks)
+				}
+				if err != nil {
 					log.Printf("[错误] 写入快照失败: %v", err)
+					return
 				}
 			}
 			}(securityID, records)
@@ -659,5 +827,8 @@ func (p *Processor) ProcessSZTick(zipPath string) (*ProcessResult, error) {
 
 // Flush 将所有缓存数据写入Parquet文件
 func (p *Processor) Flush() error {
+	if p.optMode {
+		return p.optParquetWriter.Flush()
+	}
 	return p.parquetWriter.Flush()
 }
