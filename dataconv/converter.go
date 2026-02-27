@@ -671,6 +671,11 @@ func ValidateOrder(order Order) bool {
 	if !isFinite(order.Price) || !isFinite(order.Volume) {
 		return false
 	}
+	
+	// 验证价格和数量必须大于0（过滤掉异常的0价格委托）
+	if order.Price <= 0 || order.Volume <= 0 {
+		return false
+	}
 
 	// 深市订单类型: 1/2/3, 沪市: 2/5
 	if strings.HasSuffix(order.Code, ".XSHE") {
@@ -699,6 +704,11 @@ func ValidateDeal(deal Deal) bool {
 	
 	// 验证价格、数量、金额是否有限
 	if !isFinite(deal.Price) || !isFinite(deal.Volume) || !isFinite(deal.Money) {
+		return false
+	}
+	
+	// 验证价格和数量必须大于0（过滤掉异常的0价格成交）
+	if deal.Price <= 0 || deal.Volume <= 0 {
 		return false
 	}
 
