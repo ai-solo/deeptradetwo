@@ -1,0 +1,137 @@
+[binance]
+# 当前环境: testnet, production
+current_environment = "testnet"
+# 默认代理设置
+default_proxy = "http://127.0.0.1:33210"
+timeout = 30
+max_retries = 3
+
+[binance.testnet]
+name = "testnet"
+api_key = ""
+secret_key = ""
+futures_base_url = "https://testnet.binancefuture.com"
+futures_stream_url = "wss://stream.binancefuture.com"
+debug = false
+
+[binance.production]
+name = "production"
+api_key = ""
+secret_key = ""
+futures_base_url = "https://fapi.binance.com"
+futures_stream_url = "wss://fstream.binance.com"
+debug = false
+
+[[llm]]
+# kimi
+api_key = ""
+model = "kimi-k2-thinking"
+base_url = "https://api.moonshot.cn/v1"
+#开仓时使用
+entry_enable = false
+#持仓时使用-持仓时推荐使用更快的模型
+track_enable = false
+prefx = ""
+
+[[llm]]
+# deepseek官方
+api_key = ""
+model = "deepseek-reasoner"
+base_url = "https://api.deepseek.com/v1"
+#开仓时使用
+entry_enable = true
+#持仓时使用-持仓时推荐使用更快的模型
+track_enable = true
+extra = ""
+
+[[llm]]
+# 火山引擎 deepseek-v3-1-terminus
+api_key = ""
+model = "deepseek-v3-1-terminus"
+base_url = "https://ark.cn-beijing.volces.com/api/v3"
+#开仓时使用
+entry_enable = false
+#持仓时使用-持仓时推荐使用更快的模型
+track_enable = false
+extra = "{\"thinking\":{\"type\":\"enabled\"}}"
+
+
+[[llm]]
+# 阿里百炼 deepseek-v3.2-exp
+api_key = ""
+model = "deepseek-v3.2-exp"
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+#开仓时使用
+entry_enable = false
+#持仓时使用-持仓时推荐使用更快的模型
+track_enable = false
+extra = "{\"enable_thinking\":true}"
+
+
+
+# 交易相关配置
+[trading]
+trigger_time = 20
+
+# 通联数据源配置
+[tonglian]
+# 通联客户端 WebSocket 地址 (feeder_client 监听端口)
+client_address = "localhost:9020"
+# 数据格式: json 或 csv (建议使用 json)
+data_format = "json"
+# 最大重试次数
+max_retries = 10
+# 最大退避时间(毫秒)
+backoff_max_ms = 30000
+# 订阅限制 (通联默认 300 条)
+subscription_limit = 300
+# 连接超时时间(秒)
+connection_timeout = 10
+
+# 预设订阅列表 (可选，系统启动时会自动订阅)
+# 格式: <ServiceID>.<MessageID>.<SecurityCode>
+# ServiceID: 3=上交所, 5=深交所
+# MessageID: 8=股票快照
+# 示例:
+# subscriptions = [
+#   "3.8.600000",  # 浦发银行
+#   "5.8.000001"   # 平安银行
+# ]
+
+# 存储配置
+[storage]
+# 通道缓冲区大小
+channel_buffer_size = 1000
+
+[storage.mysql]
+host = "rm-bp15t3z3kt5174n47so.mysql.rds.aliyuncs.com"
+port = 3306
+user = "hermes_trade"
+password = "1tuweN6688"
+database = "hermes"
+max_open_conns = 100
+max_idle_conns = 10
+conn_max_life_time = 3600
+
+[storage.redis]
+host = "localhost"
+port = 6379
+password = ""
+db = 0
+pool_size = 10
+
+[storage.retention]
+# 快照数据保留时间(分钟)
+snapshot_minutes = 60
+# 1分钟K线保留时间(小时)
+kline_1m_hours = 24
+# 5分钟K线保留时间(天)
+kline_5m_days = 7
+# 1小时K线保留时间(天)
+kline_1h_days = 30
+
+[storage.batch_sizes]
+# MySQL批插入大小
+mysql_insert_batch = 100
+# MySQL刷盘间隔(秒)
+mysql_flush_interval = 1
