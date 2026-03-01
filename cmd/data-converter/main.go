@@ -109,6 +109,11 @@ func runBatchMode() {
 	}
 	log.Println("========================================")
 	
+	// 创建输出目录
+	if err := os.MkdirAll(*flagOutputDir, 0755); err != nil {
+		log.Fatalf("创建输出目录失败: %v", err)
+	}
+	
 	// 初始化进度跟踪器
 	var tracker *progress.Tracker
 	progressFile := filepath.Join(*flagOutputDir, ".progress.json")
@@ -255,35 +260,60 @@ func processSingleDay(date time.Time, downloader *dataconv.Downloader) error {
 		return fmt.Errorf("创建处理器失败: %w", err)
 	}
 	
-	// 4. 一次性提交所有下载任务到 aria2
+	// 4. 检测文件状态，分类处理
 	log.Println("========================================")
-	log.Printf("[下载] 一次性提交 %d 个下载任务到 aria2...", len(tasks))
+	log.Printf("[检测] 检查 %d 个文件状态...", len(tasks))
 	
 	type downloadJob struct {
-		Task dataconv.DownloadTask
-		GID  string
-		Idx  int
+		Task     dataconv.DownloadTask
+		GID      string
+		Idx      int
+		AlreadyExists bool
 	}
 	
 	jobs := make([]downloadJob, 0, len(tasks))
+	var existsCount, needDownloadCount int
 	
+	// 检测文件并提交下载任务
 	for idx, task := range tasks {
+		// 检查文件是否已存在
+		if stat, err := os.Stat(task.LocalPath); err == nil && stat.Size() > 0 {
+			log.Printf("[已存在] [%d/%d] %s (%.1fMB, 直接处理)", 
+				idx+1, len(tasks), task.File.Name, float64(stat.Size())/1024/1024)
+			
+			jobs = append(jobs, downloadJob{
+				Task:          task,
+				GID:           "exists",
+				Idx:           idx,
+				AlreadyExists: true,
+			})
+			existsCount++
+			continue
+		}
+		
+		// 文件不存在，提交下载
 		gid, _, err := downloader.SubmitDownload(task)
 		if err != nil {
 			log.Printf("[错误] 提交下载失败 [%d/%d] %s: %v", idx+1, len(tasks), task.File.Name, err)
 			continue
 		}
 		
-		jobs = append(jobs, downloadJob{
-			Task: task,
-			GID:  gid,
-			Idx:  idx,
-		})
+		log.Printf("[提交下载] [%d/%d] %s (GID: %s)", idx+1, len(tasks), task.File.Name, gid[:8])
 		
-		log.Printf("[提交] [%d/%d] %s (GID: %s)", idx+1, len(tasks), task.File.Name, gid[:8])
+		jobs = append(jobs, downloadJob{
+			Task:          task,
+			GID:           gid,
+			Idx:           idx,
+			AlreadyExists: false,
+		})
+		needDownloadCount++
 	}
 	
-	log.Printf("[下载] 已提交 %d 个任务，aria2 开始并发下载...", len(jobs))
+	log.Println("========================================")
+	log.Printf("[统计] 已存在: %d 个, 需下载: %d 个", existsCount, needDownloadCount)
+	if needDownloadCount > 0 {
+		log.Printf("[下载] aria2 开始并发下载 %d 个文件...", needDownloadCount)
+	}
 	log.Println("========================================")
 	
 	// 5. 并发等待各个文件下载完成并处理
@@ -297,18 +327,23 @@ func processSingleDay(date time.Time, downloader *dataconv.Downloader) error {
 		go func(j downloadJob) {
 			defer wgFiles.Done()
 			
-			log.Printf("[等待] [%d/%d] %s 下载中...", j.Idx+1, len(tasks), j.Task.File.Name)
-			
-			// 等待这个文件下载完成
-			if err := downloader.WaitForDownload(j.GID, j.Task.LocalPath); err != nil {
-				log.Printf("[错误] 下载失败 [%d/%d] %s: %v", j.Idx+1, len(tasks), j.Task.File.Name, err)
-				errMutex.Lock()
-				processErrors = append(processErrors, err)
-				errMutex.Unlock()
-				return
+			// 如果文件已存在，直接处理
+			if j.AlreadyExists {
+				log.Printf("[处理] [%d/%d] %s 开始处理（文件已存在）...", j.Idx+1, len(tasks), j.Task.File.Name)
+			} else {
+				log.Printf("[等待] [%d/%d] %s 下载中...", j.Idx+1, len(tasks), j.Task.File.Name)
+				
+				// 等待这个文件下载完成
+				if err := downloader.WaitForDownload(j.GID, j.Task.LocalPath); err != nil {
+					log.Printf("[错误] 下载失败 [%d/%d] %s: %v", j.Idx+1, len(tasks), j.Task.File.Name, err)
+					errMutex.Lock()
+					processErrors = append(processErrors, err)
+					errMutex.Unlock()
+					return
+				}
+				
+				log.Printf("[完成] [%d/%d] %s 下载完成 ✓", j.Idx+1, len(tasks), j.Task.File.Name)
 			}
-			
-			log.Printf("[完成] [%d/%d] %s 下载完成 ✓", j.Idx+1, len(tasks), j.Task.File.Name)
 			
 			// 处理文件
 			if err := processFile(j.Task.LocalPath, date, processor); err != nil {

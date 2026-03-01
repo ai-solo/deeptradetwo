@@ -15,9 +15,14 @@ import (
 // 从 md_security 表查询 SECURITY_ID，用于 Code 字符串到 Int32 的映射
 type SecurityCache struct {
 	mu       sync.RWMutex
-	codeToID map[string]int32 // "600000.XSHG" -> SECURITY_ID
+	codeToID map[string]int32 // "600000.XSHG" -> SECURITY_ID, -1表示不存在
 	db       *sql.DB
 }
+
+const (
+	// SecurityNotFound 表示证券代码在数据库中不存在（负缓存）
+	SecurityNotFound = -1
+)
 
 // NewSecurityCache 创建证券代码缓存
 func NewSecurityCache(db *sql.DB) *SecurityCache {
@@ -33,6 +38,10 @@ func (sc *SecurityCache) GetID(code string) (int32, error) {
 	sc.mu.RLock()
 	if id, ok := sc.codeToID[code]; ok {
 		sc.mu.RUnlock()
+		// 检查是否为负缓存（不存在）
+		if id == SecurityNotFound {
+			return 0, fmt.Errorf("证券代码不存在（已缓存）")
+		}
 		return id, nil
 	}
 	sc.mu.RUnlock()
@@ -48,6 +57,10 @@ func (sc *SecurityCache) GetID(code string) (int32, error) {
 	query := "SELECT SECURITY_ID FROM md_security WHERE TICKER_SYMBOL = ? AND EXCHANGE_CD = ?"
 	err = sc.db.QueryRow(query, tickerSymbol, exchangeCD).Scan(&securityID)
 	if err != nil {
+		// 缓存负结果（不存在的代码），避免重复查询
+		sc.mu.Lock()
+		sc.codeToID[code] = SecurityNotFound
+		sc.mu.Unlock()
 		return 0, fmt.Errorf("查询 SECURITY_ID 失败: %w", err)
 	}
 
@@ -119,6 +132,8 @@ func (sc *SecurityCache) BatchLoad(codes []string) error {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 
+	// 记录已找到的代码
+	found := make(map[string]bool)
 	loadedCount := 0
 	for rows.Next() {
 		var ticker, exchange string
@@ -129,11 +144,24 @@ func (sc *SecurityCache) BatchLoad(codes []string) error {
 		}
 		code := fmt.Sprintf("%s.%s", ticker, exchange)
 		sc.codeToID[code] = securityID
+		found[code] = true
 		loadedCount++
+	}
+
+	// 对未找到的代码添加负缓存
+	notFoundCount := 0
+	for code := range parsed {
+		if !found[code] {
+			sc.codeToID[code] = SecurityNotFound
+			notFoundCount++
+		}
 	}
 
 	if loadedCount > 0 {
 		log.Printf("[缓存] 批量加载 %d 个证券代码", loadedCount)
+	}
+	if notFoundCount > 0 {
+		log.Printf("[缓存] %d 个证券代码不存在（已记录，避免重复查询）", notFoundCount)
 	}
 
 	return rows.Err()
