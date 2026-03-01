@@ -13,5 +13,23 @@ nohup.out
 deeptrade
 *.config.toml
 ./conf/config.toml
+
+# 数据文件和目录
 20251201
+20251201/
 output
+output/
+output_test
+output_test/
+
+# 编译的二进制文件
+data-converter
+cmd/data-converter/data-converter
+
+# 数据文件
+*.parquet
+*.csv.zip
+*.zip
+
+# 临时文件
+.tmp_*
