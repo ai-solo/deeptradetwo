@@ -266,14 +266,20 @@ func (p *Processor) ProcessSHOrderDeal(zipPath string) (*ProcessResult, error) {
 		// 清空map，释放内存
 		codeGroups = nil
 		
-		// 强制GC，对低内存环境很重要
-		runtime.GC()
-		
-		// 记录内存使用情况
-		var m runtime.MemStats
-		runtime.ReadMemStats(&m)
-		log.Printf("[内存] 当前使用: %.2f MB, 系统总分配: %.2f MB", 
-			float64(m.Alloc)/1024/1024, float64(m.TotalAlloc)/1024/1024)
+		// 优化：只在每10个chunk或内存使用超过阈值时才GC
+		if chunkNum % 10 == 0 {
+			var m runtime.MemStats
+			runtime.ReadMemStats(&m)
+			allocMB := float64(m.Alloc) / 1024 / 1024
+			
+			// 只在内存使用超过1GB时才强制GC（2GB机器留足够空间）
+			if allocMB > 1024 {
+				runtime.GC()
+				log.Printf("[内存] GC后使用: %.2f MB", float64(m.Alloc)/1024/1024)
+			} else {
+				log.Printf("[内存] 当前使用: %.2f MB (无需GC)", allocMB)
+			}
+		}
 	}
 
 	result.ValidRows = orderCount + dealCount
@@ -410,14 +416,19 @@ func (p *Processor) ProcessSHTick(zipPath string) (*ProcessResult, error) {
 		// 清空map，释放内存
 		codeGroups = nil
 		
-		// 强制GC，对低内存环境很重要
-		runtime.GC()
-		
-		// 记录内存使用情况
-		var m runtime.MemStats
-		runtime.ReadMemStats(&m)
-		log.Printf("[内存] 当前使用: %.2f MB, 系统总分配: %.2f MB", 
-			float64(m.Alloc)/1024/1024, float64(m.TotalAlloc)/1024/1024)
+		// 优化：只在每10个chunk或内存使用超过阈值时才GC
+		if chunkNum % 10 == 0 {
+			var m runtime.MemStats
+			runtime.ReadMemStats(&m)
+			allocMB := float64(m.Alloc) / 1024 / 1024
+			
+			if allocMB > 1024 {
+				runtime.GC()
+				log.Printf("[内存] GC后使用: %.2f MB", float64(m.Alloc)/1024/1024)
+			} else {
+				log.Printf("[内存] 当前使用: %.2f MB (无需GC)", allocMB)
+			}
+		}
 	}
 
 	result.Duration = time.Since(start)
@@ -540,14 +551,19 @@ func (p *Processor) ProcessSZOrder(zipPath string) (*ProcessResult, error) {
 		// 清空map，释放内存
 		codeGroups = nil
 		
-		// 强制GC，对低内存环境很重要
-		runtime.GC()
-		
-		// 记录内存使用情况
-		var m runtime.MemStats
-		runtime.ReadMemStats(&m)
-		log.Printf("[内存] 当前使用: %.2f MB, 系统总分配: %.2f MB", 
-			float64(m.Alloc)/1024/1024, float64(m.TotalAlloc)/1024/1024)
+		// 优化：只在每10个chunk或内存使用超过阈值时才GC
+		if chunkNum % 10 == 0 {
+			var m runtime.MemStats
+			runtime.ReadMemStats(&m)
+			allocMB := float64(m.Alloc) / 1024 / 1024
+			
+			if allocMB > 1024 {
+				runtime.GC()
+				log.Printf("[内存] GC后使用: %.2f MB", float64(m.Alloc)/1024/1024)
+			} else {
+				log.Printf("[内存] 当前使用: %.2f MB (无需GC)", allocMB)
+			}
+		}
 	}
 
 	result.Duration = time.Since(start)
@@ -670,14 +686,19 @@ func (p *Processor) ProcessSZDeal(zipPath string) (*ProcessResult, error) {
 		// 清空map，释放内存
 		codeGroups = nil
 		
-		// 强制GC，对低内存环境很重要
-		runtime.GC()
-		
-		// 记录内存使用情况
-		var m runtime.MemStats
-		runtime.ReadMemStats(&m)
-		log.Printf("[内存] 当前使用: %.2f MB, 系统总分配: %.2f MB", 
-			float64(m.Alloc)/1024/1024, float64(m.TotalAlloc)/1024/1024)
+		// 优化：只在每10个chunk或内存使用超过阈值时才GC
+		if chunkNum % 10 == 0 {
+			var m runtime.MemStats
+			runtime.ReadMemStats(&m)
+			allocMB := float64(m.Alloc) / 1024 / 1024
+			
+			if allocMB > 1024 {
+				runtime.GC()
+				log.Printf("[内存] GC后使用: %.2f MB", float64(m.Alloc)/1024/1024)
+			} else {
+				log.Printf("[内存] 当前使用: %.2f MB (无需GC)", allocMB)
+			}
+		}
 	}
 
 	result.Duration = time.Since(start)
@@ -812,14 +833,19 @@ func (p *Processor) ProcessSZTick(zipPath string) (*ProcessResult, error) {
 		// 清空map，释放内存
 		codeGroups = nil
 		
-		// 强制GC，对低内存环境很重要
-		runtime.GC()
-		
-		// 记录内存使用情况
-		var m runtime.MemStats
-		runtime.ReadMemStats(&m)
-		log.Printf("[内存] 当前使用: %.2f MB, 系统总分配: %.2f MB", 
-			float64(m.Alloc)/1024/1024, float64(m.TotalAlloc)/1024/1024)
+		// 优化：只在每10个chunk或内存使用超过阈值时才GC
+		if chunkNum % 10 == 0 {
+			var m runtime.MemStats
+			runtime.ReadMemStats(&m)
+			allocMB := float64(m.Alloc) / 1024 / 1024
+			
+			if allocMB > 1024 {
+				runtime.GC()
+				log.Printf("[内存] GC后使用: %.2f MB", float64(m.Alloc)/1024/1024)
+			} else {
+				log.Printf("[内存] 当前使用: %.2f MB (无需GC)", allocMB)
+			}
+		}
 	}
 
 	result.Duration = time.Since(start)

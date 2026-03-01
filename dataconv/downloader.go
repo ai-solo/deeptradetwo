@@ -140,42 +140,45 @@ func (d *Downloader) FilterAndSortFiles(files []fileserver.FileInfo, date time.T
 	return tasks
 }
 
-func (d *Downloader) DownloadFile(task DownloadTask) error {
+// SubmitDownload 提交下载任务（不等待完成）
+func (d *Downloader) SubmitDownload(task DownloadTask) (gid string, localPath string, err error) {
 	// 创建目录
 	dir := filepath.Dir(task.LocalPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("create directory: %w", err)
+		return "", "", fmt.Errorf("create directory: %w", err)
 	}
 
 	// 检查文件是否已存在
 	if _, err := os.Stat(task.LocalPath); err == nil {
 		log.Printf("[跳过] 文件已存在: %s", task.File.Name)
-		return nil
+		return "exists", task.LocalPath, nil
 	}
 
-	// 提交下载任务
-	log.Printf("[下载] 提交任务: %s (%.1fMB)", task.File.Name, float64(task.File.Size)/1024/1024)
-	
 	options := aria2.DownloadOptions{
 		Out:              task.File.Name,
 		Dir:              dir,
 		CheckCertificate: "false",
 	}
 
-	gid, err := d.aria2Client.AddDownload(task.DownloadURL, options)
+	gid, err = d.aria2Client.AddDownload(task.DownloadURL, options)
 	if err != nil {
-		return fmt.Errorf("submit download: %w", err)
+		return "", "", fmt.Errorf("submit download: %w", err)
 	}
 
-	log.Printf("[下载] 任务GID: %s", gid)
+	return gid, task.LocalPath, nil
+}
+
+// WaitForDownload 等待指定 GID 的下载完成
+func (d *Downloader) WaitForDownload(gid, localPath string) error {
+	// 如果文件已存在（跳过的文件）
+	if gid == "exists" {
+		return nil
+	}
 
 	// 等待下载完成
 	if err := d.aria2Client.WaitForCompletion(gid, d.downloadTimeout); err != nil {
 		return fmt.Errorf("wait completion: %w", err)
 	}
-
-	fmt.Println() // 换行（因为进度条在同一行）
-	log.Printf("[下载] 完成 ✓")
 
 	// 清理 aria2 任务记录
 	if err := d.aria2Client.RemoveDownloadResult(gid); err != nil {
@@ -183,10 +186,31 @@ func (d *Downloader) DownloadFile(task DownloadTask) error {
 	}
 
 	// 验证文件
-	if _, err := os.Stat(task.LocalPath); err != nil {
+	if _, err := os.Stat(localPath); err != nil {
 		return fmt.Errorf("file not found after download: %w", err)
 	}
 
+	return nil
+}
+
+// DownloadFile 下载文件（保留向后兼容，单日处理模式使用）
+func (d *Downloader) DownloadFile(task DownloadTask) error {
+	log.Printf("[下载] 提交任务: %s (%.1fMB)", task.File.Name, float64(task.File.Size)/1024/1024)
+	
+	gid, localPath, err := d.SubmitDownload(task)
+	if err != nil {
+		return err
+	}
+	
+	log.Printf("[下载] 任务GID: %s", gid)
+	
+	if err := d.WaitForDownload(gid, localPath); err != nil {
+		return err
+	}
+	
+	fmt.Println() // 换行（因为进度条在同一行）
+	log.Printf("[下载] 完成 ✓")
+	
 	return nil
 }
 

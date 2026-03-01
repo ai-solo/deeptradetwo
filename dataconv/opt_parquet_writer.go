@@ -55,12 +55,12 @@ func NewOptParquetWriter(outputDir string, tradingDay time.Time, securityCache *
 		rangeChecker:   rangeChecker,
 		forceInt32:     forceInt32,
 		tradingDay:     tradingDay,
-		orders:         make([]Order, 0, 1000),
-		deals:          make([]Deal, 0, 1000),
-		ticks:          make([]Tick, 0, 500),
-		maxOrderBuffer: 10000,
-		maxDealBuffer:  10000,
-		maxTickBuffer:  5000,
+		orders:         make([]Order, 0, 500),
+		deals:          make([]Deal, 0, 500),
+		ticks:          make([]Tick, 0, 300),
+		maxOrderBuffer: 10000,  // 增加buffer，减少写入频率
+		maxDealBuffer:  10000,  // 增加buffer，减少写入频率
+		maxTickBuffer:  5000,   // 增加buffer，减少写入频率
 	}
 
 	// 如果配置了 OSS，初始化上传器

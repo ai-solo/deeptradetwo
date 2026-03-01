@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"time"
 
 	"deeptrade/dataconv"
@@ -25,11 +26,11 @@ var (
 	flagMarket     = flag.String("market", "all", "市场: sh, sz, all")
 	flagWorkers    = flag.Int("workers", 0, "并发数 (默认CPU核心数)")
 	flagPassword   = flag.String("password", "DataYes", "ZIP密码")
-	flagDataPrefix = flag.String("prefix", "", "数据文件路径前缀 (可选)")
-	flagNoMySQL    = flag.Bool("no-mysql", false, "不使用MySQL (涨跌停价格将为0)")
-	flagLimit      = flag.Int("limit", 0, "限制处理行数 (0表示不限制，用于测试)")
-	flagOptimize   = flag.Bool("optimize", false, "启用优化模式 (Int32+Zstd压缩，需MySQL)")
-	flagForceInt32 = flag.Bool("force-int32", false, "强制Int32模式 (不检测超限，有溢出风险)")
+	flagDataPrefix   = flag.String("prefix", "", "数据文件路径前缀 (可选)")
+	flagNoMySQL      = flag.Bool("no-mysql", false, "不使用MySQL (涨跌停价格将为0)")
+	flagLimit        = flag.Int("limit", 0, "限制处理行数 (0表示不限制，用于测试)")
+	flagOptimize     = flag.Bool("optimize", false, "启用优化模式 (Int32+Zstd压缩，需MySQL)")
+	flagForceInt32   = flag.Bool("force-int32", false, "强制Int32模式 (不检测超限，有溢出风险)")
 	
 	// OSS 相关参数
 	flagOSS          = flag.Bool("oss", false, "启用阿里云 OSS 上传")
@@ -254,27 +255,82 @@ func processSingleDay(date time.Time, downloader *dataconv.Downloader) error {
 		return fmt.Errorf("创建处理器失败: %w", err)
 	}
 	
-	// 4. 逐个下载和处理文件
+	// 4. 一次性提交所有下载任务到 aria2
+	log.Println("========================================")
+	log.Printf("[下载] 一次性提交 %d 个下载任务到 aria2...", len(tasks))
+	
+	type downloadJob struct {
+		Task dataconv.DownloadTask
+		GID  string
+		Idx  int
+	}
+	
+	jobs := make([]downloadJob, 0, len(tasks))
+	
 	for idx, task := range tasks {
-		log.Println("----------------------------------------")
-		log.Printf("[%d/%d] %s", idx+1, len(tasks), task.File.Name)
-		
-		// 下载文件
-		if err := downloader.DownloadFile(task); err != nil {
-			log.Printf("[错误] 下载失败: %v", err)
+		gid, _, err := downloader.SubmitDownload(task)
+		if err != nil {
+			log.Printf("[错误] 提交下载失败 [%d/%d] %s: %v", idx+1, len(tasks), task.File.Name, err)
 			continue
 		}
 		
-		// 处理文件
-		if err := processFile(task.LocalPath, date, processor); err != nil {
-			log.Printf("[错误] 处理失败: %v", err)
-			// 继续处理其他文件
-		}
+		jobs = append(jobs, downloadJob{
+			Task: task,
+			GID:  gid,
+			Idx:  idx,
+		})
 		
-		// 清理原始文件
-		if err := downloader.CleanupFile(task.LocalPath); err != nil {
-			log.Printf("[警告] 清理文件失败: %v", err)
-		}
+		log.Printf("[提交] [%d/%d] %s (GID: %s)", idx+1, len(tasks), task.File.Name, gid[:8])
+	}
+	
+	log.Printf("[下载] 已提交 %d 个任务，aria2 开始并发下载...", len(jobs))
+	log.Println("========================================")
+	
+	// 5. 并发等待各个文件下载完成并处理
+	var wgFiles sync.WaitGroup
+	var processErrors []error
+	var errMutex sync.Mutex
+	
+	for _, job := range jobs {
+		wgFiles.Add(1)
+		
+		go func(j downloadJob) {
+			defer wgFiles.Done()
+			
+			log.Printf("[等待] [%d/%d] %s 下载中...", j.Idx+1, len(tasks), j.Task.File.Name)
+			
+			// 等待这个文件下载完成
+			if err := downloader.WaitForDownload(j.GID, j.Task.LocalPath); err != nil {
+				log.Printf("[错误] 下载失败 [%d/%d] %s: %v", j.Idx+1, len(tasks), j.Task.File.Name, err)
+				errMutex.Lock()
+				processErrors = append(processErrors, err)
+				errMutex.Unlock()
+				return
+			}
+			
+			log.Printf("[完成] [%d/%d] %s 下载完成 ✓", j.Idx+1, len(tasks), j.Task.File.Name)
+			
+			// 处理文件
+			if err := processFile(j.Task.LocalPath, date, processor); err != nil {
+				log.Printf("[错误] 处理失败 [%d/%d] %s: %v", j.Idx+1, len(tasks), j.Task.File.Name, err)
+				errMutex.Lock()
+				processErrors = append(processErrors, err)
+				errMutex.Unlock()
+				return
+			}
+			
+			// 清理原始文件
+			if err := downloader.CleanupFile(j.Task.LocalPath); err != nil {
+				log.Printf("[警告] 清理文件失败: %v", err)
+			}
+		}(job)
+	}
+	
+	// 等待所有文件处理完成
+	wgFiles.Wait()
+	
+	if len(processErrors) > 0 {
+		log.Printf("[警告] %d 个文件处理失败", len(processErrors))
 	}
 	
 	// 5. 写入 Parquet
@@ -504,16 +560,18 @@ func generateDateRange() ([]time.Time, error) {
 }
 
 // getWorkers 获取并发数
+// 数据处理是IO密集型任务，可以使用更多goroutine
 func getWorkers() int {
 	workers := *flagWorkers
 	if workers <= 0 {
 		cpuCount := runtime.NumCPU()
+		// 优化：IO密集型任务，即使2核也可以用更多goroutine
 		if cpuCount <= 2 {
-			workers = 1
+			workers = 8  // 2核机器使用8个worker（原来是1）
 		} else if cpuCount <= 4 {
-			workers = 2
+			workers = 12 // 4核机器使用12个worker（原来是2）
 		} else {
-			workers = cpuCount / 3
+			workers = cpuCount * 3 // 更多核心按3倍设置
 		}
 	}
 	return workers
