@@ -79,18 +79,32 @@ func NewOSSUploader(cfg OSSConfig) (*OSSUploader, error) {
 // tradingDay: 交易日期
 // code: 股票代码
 func (u *OSSUploader) UploadFile(localPath string, dataType DataType, tradingDay time.Time, code string) error {
-	// 构建 OSS 路径: market_data/{data_type}/{year}/{month}/{filename}
-	year := tradingDay.Format("2006")
-	month := tradingDay.Format("01")
+	// 构建 OSS 路径: {year}/{yearmonth}/{yearmonthday}/{filename}
+	// 例如: 2025/202512/20251231/20251231_deal.parquet
+	year := tradingDay.Format("2006")       // 2025
+	yearMonth := tradingDay.Format("200601") // 202512
+	yearMonthDay := tradingDay.Format("20060102") // 20251231
 	filename := filepath.Base(localPath)
 	
-	ossPath := fmt.Sprintf("%s/%s/%s/%s/%s",
-		u.basePath,
-		dataType,
-		year,
-		month,
-		filename,
-	)
+	var ossPath string
+	if u.basePath != "" && u.basePath != "market_data" {
+		// 如果有自定义 basePath，则添加前缀
+		ossPath = fmt.Sprintf("%s/%s/%s/%s/%s",
+			u.basePath,
+			year,
+			yearMonth,
+			yearMonthDay,
+			filename,
+		)
+	} else {
+		// 否则直接使用日期路径
+		ossPath = fmt.Sprintf("%s/%s/%s/%s",
+			year,
+			yearMonth,
+			yearMonthDay,
+			filename,
+		)
+	}
 
 	// 上传文件
 	err := u.bucket.PutObjectFromFile(ossPath, localPath)
