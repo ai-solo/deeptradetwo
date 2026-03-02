@@ -316,7 +316,7 @@ func (w *OptParquetWriter) checkAndConvertOrder(order Order, builder *array.Reco
 	idx := 0
 
 	// Code: String -> Int32 (SECURITY_ID)
-	codeID, err := w.securityCache.GetID(order.Code)
+	codeID, err := w.securityCache.GetIDWithDate(order.Code, w.tradingDay)
 	if err != nil {
 		return fmt.Errorf("获取 SECURITY_ID 失败 [%s]: %w", order.Code, err)
 	}
@@ -454,7 +454,7 @@ func (w *OptParquetWriter) checkAndConvertDeal(deal Deal, builder *array.RecordB
 	idx := 0
 
 	// Code: String -> Int32
-	codeID, err := w.securityCache.GetID(deal.Code)
+	codeID, err := w.securityCache.GetIDWithDate(deal.Code, w.tradingDay)
 	if err != nil {
 		return fmt.Errorf("获取 SECURITY_ID 失败 [%s]: %w", deal.Code, err)
 	}
@@ -628,7 +628,7 @@ func (w *OptParquetWriter) checkAndConvertTick(tick Tick, builder *array.RecordB
 	idx := 0
 
 	// Code: String -> Int32
-	codeID, err := w.securityCache.GetID(tick.Code)
+	codeID, err := w.securityCache.GetIDWithDate(tick.Code, w.tradingDay)
 	if err != nil {
 		return fmt.Errorf("获取 SECURITY_ID 失败 [%s]: %w", tick.Code, err)
 	}

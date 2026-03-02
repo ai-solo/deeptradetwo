@@ -20,12 +20,13 @@ type Processor struct {
 	optParquetWriter *OptParquetWriter // 优化模式写入器
 	priceRepo        *LimitPriceRepository
 	priceCache       *PriceCache
-	securityCache    *SecurityCache // 证券代码缓存
+	securityCache    *SecurityCache    // 证券代码缓存
 	rangeChecker     *DataRangeChecker // 数据范围检查器
-	optMode          bool            // 是否启用优化模式
-	forceInt32       bool            // 强制使用 Int32（不检测）
+	optMode          bool              // 是否启用优化模式
+	forceInt32       bool              // 强制使用 Int32（不检测）
 	workers          int
-	rowLimit         int // 限制处理行数
+	rowLimit         int       // 限制处理行数
+	tradingDay       time.Time // 当前处理的交易日，用于历史代码映射
 }
 
 // ProcessorConfig 处理器配置
@@ -118,6 +119,7 @@ func NewProcessor(cfg ProcessorConfig) (*Processor, error) {
 		forceInt32:       cfg.ForceInt32,
 		workers:          cfg.Workers,
 		rowLimit:         cfg.RowLimit,
+		tradingDay:       cfg.TradingDay,
 	}, nil
 }
 
@@ -196,7 +198,7 @@ func (p *Processor) ProcessSHOrderDeal(zipPath string) (*ProcessResult, error) {
 				code := FormatCode(int(parseInt64(sid)))
 				codes = append(codes, code)
 			}
-			if err := p.securityCache.BatchLoad(codes); err != nil {
+			if err := p.securityCache.BatchLoad(codes, p.tradingDay); err != nil {
 				log.Printf("[警告] 批量预加载本批 %d 个证券失败: %v", len(codes), err)
 			}
 		}
@@ -354,7 +356,7 @@ func (p *Processor) ProcessSHTick(zipPath string) (*ProcessResult, error) {
 				code := FormatCode(int(parseInt64(sid)))
 				codes = append(codes, code)
 			}
-			if err := p.securityCache.BatchLoad(codes); err != nil {
+			if err := p.securityCache.BatchLoad(codes, p.tradingDay); err != nil {
 				log.Printf("[警告] 批量预加载本批 %d 个证券失败: %v", len(codes), err)
 			}
 		}
@@ -501,7 +503,7 @@ func (p *Processor) ProcessSZOrder(zipPath string) (*ProcessResult, error) {
 				code := FormatCode(int(parseInt64(sid)))
 				codes = append(codes, code)
 			}
-			if err := p.securityCache.BatchLoad(codes); err != nil {
+			if err := p.securityCache.BatchLoad(codes, p.tradingDay); err != nil {
 				log.Printf("[警告] 批量预加载本批 %d 个证券失败: %v", len(codes), err)
 			}
 		}
@@ -636,7 +638,7 @@ func (p *Processor) ProcessSZDeal(zipPath string) (*ProcessResult, error) {
 				code := FormatCode(int(parseInt64(sid)))
 				codes = append(codes, code)
 			}
-			if err := p.securityCache.BatchLoad(codes); err != nil {
+			if err := p.securityCache.BatchLoad(codes, p.tradingDay); err != nil {
 				log.Printf("[警告] 批量预加载本批 %d 个证券失败: %v", len(codes), err)
 			}
 		}
@@ -771,7 +773,7 @@ func (p *Processor) ProcessSZTick(zipPath string) (*ProcessResult, error) {
 				code := FormatCode(int(parseInt64(sid)))
 				codes = append(codes, code)
 			}
-			if err := p.securityCache.BatchLoad(codes); err != nil {
+			if err := p.securityCache.BatchLoad(codes, p.tradingDay); err != nil {
 				log.Printf("[警告] 批量预加载本批 %d 个证券失败: %v", len(codes), err)
 			}
 		}
