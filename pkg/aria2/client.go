@@ -63,7 +63,7 @@ func NewClient(url, token string) *Client {
 
 func (c *Client) call(method string, params []interface{}) (json.RawMessage, error) {
 	reqID := fmt.Sprintf("%.16f", rand.Float64())
-	
+
 	req := JSONRPCRequest{
 		ID:      reqID,
 		JSONRPC: "2.0",
