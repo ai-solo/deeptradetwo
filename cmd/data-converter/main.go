@@ -45,8 +45,10 @@ var (
 	flagAutoDownload     = flag.Bool("auto-download", false, "启用自动下载模式")
 	flagAria2URL         = flag.String("aria2-url", "http://121.43.209.82:6800/jsonrpc", "Aria2 JSON-RPC地址")
 	flagAria2Token       = flag.String("aria2-token", "", "Aria2 认证token")
-	flagFileServerURL    = flag.String("fileserver-url", "http://121.43.209.82:5244", "文件服务器地址")
-	flagFileServerAuth   = flag.String("fileserver-auth", "", "文件服务器Authorization token")
+	flagFileServerURL      = flag.String("fileserver-url", "http://121.43.209.82:5244", "文件服务器地址")
+	flagFileServerAuth     = flag.String("fileserver-auth", "", "文件服务器Authorization token (可选，过期时自动重新登录)")
+	flagFileServerUser     = flag.String("fileserver-username", "admin", "文件服务器登录用户名 (用于token过期时自动重新登录)")
+	flagFileServerPassHash = flag.String("fileserver-password", "", "文件服务器登录密码SHA256哈希值 (用于token过期时自动重新登录)")
 	flagDownloadDir      = flag.String("download-dir", "/data/raw", "下载目录")
 	flagKeepRaw          = flag.Bool("keep-raw", false, "处理完成后保留原始ZIP文件")
 	flagDownloadTimeout  = flag.Int("download-timeout", 1800, "单个文件下载超时时间(秒)")
@@ -141,6 +143,8 @@ func runBatchMode() {
 		*flagAria2Token,
 		*flagFileServerURL,
 		*flagFileServerAuth,
+		*flagFileServerUser,
+		*flagFileServerPassHash,
 		*flagDownloadDir,
 		*flagKeepRaw,
 		time.Duration(*flagDownloadTimeout)*time.Second,
