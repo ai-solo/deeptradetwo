@@ -28,10 +28,14 @@ type DownloadTask struct {
 	Priority     int // 数字越小优先级越高
 }
 
-func NewDownloader(aria2URL, aria2Token, fileServerURL, fileServerAuth, downloadDir string, keepRaw bool, timeout time.Duration) *Downloader {
+func NewDownloader(aria2URL, aria2Token, fileServerURL, fileServerAuth, fileServerUser, fileServerPassHash, downloadDir string, keepRaw bool, timeout time.Duration) *Downloader {
+	fsClient := fileserver.NewClient(fileServerURL, fileServerAuth)
+	if fileServerUser != "" && fileServerPassHash != "" {
+		fsClient.SetCredentials(fileServerUser, fileServerPassHash)
+	}
 	return &Downloader{
 		aria2Client:      aria2.NewClient(aria2URL, aria2Token),
-		fileServerClient: fileserver.NewClient(fileServerURL, fileServerAuth),
+		fileServerClient: fsClient,
 		downloadDir:      downloadDir,
 		keepRaw:          keepRaw,
 		downloadTimeout:  timeout,
