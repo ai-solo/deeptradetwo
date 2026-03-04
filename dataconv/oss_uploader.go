@@ -169,20 +169,34 @@ func (u *OSSUploader) ObjectExists(ossKey string) bool {
 	return exist
 }
 
-// DailyParquetFiles 每个交易日在 OSS 中应有的四个 Parquet 文件名
-func DailyParquetFileNames(tradingDay time.Time) []string {
+// DailyParquetFileNames 返回某交易日在 OSS 中应有的 Parquet 文件名列表。
+// withDailyBasic=true 时包含 daily_basic_data（共4个），否则只含 order/deal/tick（共3个）。
+func DailyParquetFileNames(tradingDay time.Time, withDailyBasic bool) []string {
 	d := tradingDay.Format("20060102")
-	return []string{
+	names := []string{
 		d + "_order.parquet",
 		d + "_deal.parquet",
 		d + "_tick.parquet",
-		d + "_daily_basic_data.parquet",
 	}
+	if withDailyBasic {
+		names = append(names, d+"_daily_basic_data.parquet")
+	}
+	return names
 }
 
-// AllDayFilesExist 检查某交易日的四个 Parquet 文件是否全部已在 OSS 中
+// TradeDataFilesExist 检查某交易日的 order/deal/tick 三个 Parquet 是否全部已在 OSS 中
+func (u *OSSUploader) TradeDataFilesExist(tradingDay time.Time) bool {
+	for _, name := range DailyParquetFileNames(tradingDay, false) {
+		if !u.ObjectExists(u.BuildFilePath(tradingDay, name)) {
+			return false
+		}
+	}
+	return true
+}
+
+// AllDayFilesExist 检查某交易日的四个 Parquet 文件（含 daily_basic_data）是否全部已在 OSS 中
 func (u *OSSUploader) AllDayFilesExist(tradingDay time.Time) bool {
-	for _, name := range DailyParquetFileNames(tradingDay) {
+	for _, name := range DailyParquetFileNames(tradingDay, true) {
 		if !u.ObjectExists(u.BuildFilePath(tradingDay, name)) {
 			return false
 		}

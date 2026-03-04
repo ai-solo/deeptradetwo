@@ -230,15 +230,52 @@ func runBatchMode() {
 func processSingleDay(date time.Time, downloader *dataconv.Downloader) error {
 	dayStart := time.Now()
 
-	// 0. 若启用 OSS 且未跳过检查，先判断四个 Parquet 是否均已存在
+	// 0. OSS 预检：根据结果文件是否存在决定跳过策略
+	//
+	//   情况A：order/deal/tick 全在 OSS，daily_basic 也在（或未开启）→ 整天跳过
+	//   情况B：order/deal/tick 全在 OSS，仅 daily_basic 缺失            → 跳过下载，只补跑 SQL
+	//   情况C：order/deal/tick 有缺失                                   → 走完整下载+处理流程
 	if *flagOSS && !*flagDailyBasicSkipOSS {
 		ossConfig := getOSSConfig()
 		if ossConfig != nil {
 			if uploader, err := dataconv.NewOSSUploader(*ossConfig); err == nil {
-				if uploader.AllDayFilesExist(date) {
-					log.Printf("[跳过] %s 的四个 Parquet 文件已全部在 OSS 中，跳过处理",
-						date.Format("2006-01-02"))
+				tradeExist := uploader.TradeDataFilesExist(date)
+				dailyBasicExist := !*flagDailyBasic || uploader.ObjectExists(
+					uploader.BuildFilePath(date, date.Format("20060102")+"_daily_basic_data.parquet"),
+				)
+
+				if tradeExist && dailyBasicExist {
+					// 情况A：全部存在，整天跳过
+					log.Printf("[跳过] %s 所有结果文件已在 OSS，跳过", date.Format("2006-01-02"))
 					return nil
+				}
+
+				if tradeExist && !dailyBasicExist {
+					// 情况B：tick/order/deal 已有，只需补 daily_basic_data
+					log.Printf("[补充] %s order/deal/tick 已在 OSS，仅补生成 daily_basic_data",
+						date.Format("2006-01-02"))
+					n, err := dataconv.GenerateDailyBasicData(dataconv.DailyBasicConfig{
+						TradingDay: date,
+						OutputDir:  *flagOutputDir,
+						OSSConfig:  ossConfig,
+					})
+					if err != nil {
+						log.Printf("[daily_basic] 生成失败: %v", err)
+					} else {
+						log.Printf("[daily_basic] 成功生成 %d 个文件 ✓", n)
+					}
+					return nil
+				}
+
+				// 情况C：trade 文件缺失，打印缺失列表后继续走下载流程
+				log.Printf("[缺失] %s 部分文件需要重新处理:", date.Format("2006-01-02"))
+				for _, name := range dataconv.DailyParquetFileNames(date, *flagDailyBasic) {
+					key := uploader.BuildFilePath(date, name)
+					if uploader.ObjectExists(key) {
+						log.Printf("  [已存在] %s", name)
+					} else {
+						log.Printf("  [缺失]   %s", name)
+					}
 				}
 			}
 		}
@@ -800,7 +837,7 @@ func runDailyBasicMonthMode() {
 				continue
 			}
 			// 输出缺失的文件名
-			for _, name := range dataconv.DailyParquetFileNames(date) {
+			for _, name := range dataconv.DailyParquetFileNames(date, true) {
 				ossKey := uploader.BuildFilePath(date, name)
 				if !uploader.ObjectExists(ossKey) {
 					log.Printf("[缺失] %s", name)
