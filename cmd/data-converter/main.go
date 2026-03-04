@@ -181,6 +181,28 @@ func runBatchMode() {
 		
 		// 检查是否已处理
 		if *flagResume && tracker.IsProcessed(dateStr) {
+			// 若开启了 -daily-basic，还需确认 daily_basic_data 已在 OSS，
+			// 否则即使 trade 数据已处理，也要补跑 SQL 生成第4份文件。
+			if *flagDailyBasic && *flagOSS && !*flagDailyBasicSkipOSS {
+				if ossConfig := getOSSConfig(); ossConfig != nil {
+					if uploader, err := dataconv.NewOSSUploader(*ossConfig); err == nil {
+						dailyBasicKey := uploader.BuildFilePath(date, dateStr+"_daily_basic_data.parquet")
+						if !uploader.ObjectExists(dailyBasicKey) {
+							log.Printf("[补充] %s 已处理，但 daily_basic_data 缺失，补生成...", dateStr)
+							n, genErr := dataconv.GenerateDailyBasicData(dataconv.DailyBasicConfig{
+								TradingDay: date,
+								OutputDir:  *flagOutputDir,
+								OSSConfig:  ossConfig,
+							})
+							if genErr != nil {
+								log.Printf("[daily_basic] 生成失败: %v", genErr)
+							} else {
+								log.Printf("[daily_basic] 成功生成 %d 个文件 ✓", n)
+							}
+						}
+					}
+				}
+			}
 			log.Printf("[跳过] 已处理")
 			skipDays++
 			continue
