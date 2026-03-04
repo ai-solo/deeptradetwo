@@ -147,3 +147,68 @@ func (u *OSSUploader) BatchUpload(files []string, dataType DataType, tradingDay 
 func DeleteLocalFile(path string) error {
 	return os.Remove(path)
 }
+
+// BuildFilePath 根据交易日和文件名构建 OSS 对象 Key，与 UploadFile 的路径规则保持一致
+func (u *OSSUploader) BuildFilePath(tradingDay time.Time, filename string) string {
+	year        := tradingDay.Format("2006")
+	yearMonth   := tradingDay.Format("200601")
+	yearMonthDay := tradingDay.Format("20060102")
+	if u.basePath != "" && u.basePath != "market_data" {
+		return fmt.Sprintf("%s/%s/%s/%s/%s", u.basePath, year, yearMonth, yearMonthDay, filename)
+	}
+	return fmt.Sprintf("%s/%s/%s/%s", year, yearMonth, yearMonthDay, filename)
+}
+
+// ObjectExists 检查 OSS 中指定 key 的对象是否存在
+func (u *OSSUploader) ObjectExists(ossKey string) bool {
+	exist, err := u.bucket.IsObjectExist(ossKey)
+	if err != nil {
+		log.Printf("[OSS] IsObjectExist 错误 key=%s: %v", ossKey, err)
+		return false
+	}
+	return exist
+}
+
+// DailyParquetFileNames 返回某交易日在 OSS 中应有的 Parquet 文件名列表。
+// withDailyBasic=true 时包含 daily_basic_data（共4个），否则只含 order/deal/tick（共3个）。
+func DailyParquetFileNames(tradingDay time.Time, withDailyBasic bool) []string {
+	d := tradingDay.Format("20060102")
+	names := []string{
+		d + "_order.parquet",
+		d + "_deal.parquet",
+		d + "_tick.parquet",
+	}
+	if withDailyBasic {
+		names = append(names, d+"_daily_basic_data.parquet")
+	}
+	return names
+}
+
+// TradeDataFilesExist 检查某交易日的 order/deal/tick 三个 Parquet 是否全部已在 OSS 中
+func (u *OSSUploader) TradeDataFilesExist(tradingDay time.Time) bool {
+	for _, name := range DailyParquetFileNames(tradingDay, false) {
+		if !u.ObjectExists(u.BuildFilePath(tradingDay, name)) {
+			return false
+		}
+	}
+	return true
+}
+
+// AllDayFilesExist 检查某交易日的四个 Parquet 文件（含 daily_basic_data）是否全部已在 OSS 中
+func (u *OSSUploader) AllDayFilesExist(tradingDay time.Time) bool {
+	for _, name := range DailyParquetFileNames(tradingDay, true) {
+		if !u.ObjectExists(u.BuildFilePath(tradingDay, name)) {
+			return false
+		}
+	}
+	return true
+}
+
+// UploadLocalFile 将本地文件直接按指定 OSS key 上传
+func (u *OSSUploader) UploadLocalFile(localPath, ossKey string) error {
+	if err := u.bucket.PutObjectFromFile(ossKey, localPath); err != nil {
+		return fmt.Errorf("OSS上传失败 [%s]: %w", ossKey, err)
+	}
+	log.Printf("[OSS] 上传成功: %s", ossKey)
+	return nil
+}

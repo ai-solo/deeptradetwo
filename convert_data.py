@@ -1,6 +1,7 @@
 import re
 import os
 import gc
+import io
 import time
 import py7zr
 import zipfile
@@ -9,12 +10,31 @@ import datetime
 import numpy as np
 import pandas as pd
 import multiprocessing as mp
-from typing import Union, Tuple
+from typing import Union, Tuple, Optional
 from .db.mysql_db import MySQLDB
 from .db.clickhouse_db import *
 from .config import dir_datayes_data, dir_kuanrui_data, dir_mdatayes_data, dir_unzip_tmp, g_datayes_password
 from keynes.common.log import configure_logging
 from concurrent.futures import ProcessPoolExecutor
+
+try:
+    import oss2
+    _OSS_AVAILABLE = True
+except ImportError:
+    _OSS_AVAILABLE = False
+
+# ---------------------------------------------------------------------------
+# OSS configuration — read from environment variables
+# ---------------------------------------------------------------------------
+OSS_ACCESS_KEY_ID     = os.environ.get("OSS_ACCESS_KEY_ID", "")
+OSS_ACCESS_KEY_SECRET = os.environ.get("OSS_ACCESS_KEY_SECRET", "")
+OSS_ENDPOINT          = os.environ.get("OSS_ENDPOINT", "oss-cn-hangzhou.aliyuncs.com")
+OSS_BUCKET_NAME       = os.environ.get("OSS_BUCKET_NAME", "")
+# OSS directory prefix for daily basic data parquets, e.g. "quant/daily_basic_data/"
+OSS_BASIC_DATA_PREFIX = os.environ.get("OSS_BASIC_DATA_PREFIX", "daily_basic_data/")
+
+# The four parquet files generated per trading day
+DAILY_BASIC_FILE_TYPES = ["equity_data", "exposure_sw21", "daily_basic_data", "mkt_idx"]
 
 g_logger = configure_logging(__name__, with_console=True)
 
@@ -927,3 +947,227 @@ def convert_mdata(trading_month: str, num_workers: int=16):
     # ck_db.optimize_table(g_table_name_deal)
     # ck_db.optimize_table(g_table_name_convert_info)
     return None
+
+
+# ===========================================================================
+# Daily basic data — OSS parquet pipeline
+# ===========================================================================
+
+def _get_oss_bucket():
+    """Create and return an OSS Bucket instance using env-var credentials."""
+    if not _OSS_AVAILABLE:
+        raise ImportError("oss2 is not installed. Run: pip install oss2")
+    auth = oss2.Auth(OSS_ACCESS_KEY_ID, OSS_ACCESS_KEY_SECRET)
+    return oss2.Bucket(auth, OSS_ENDPOINT, OSS_BUCKET_NAME)
+
+
+def _oss_object_exists(bucket, oss_key: str) -> bool:
+    """Return True if the object exists in OSS, False otherwise."""
+    try:
+        bucket.head_object(oss_key)
+        return True
+    except oss2.exceptions.NoSuchKey:
+        return False
+    except Exception as e:
+        g_logger.warning(f"OSS head_object error for key '{oss_key}': {e}")
+        return False
+
+
+def _check_day_files_in_oss(bucket, trading_day: pd.Timestamp, oss_prefix: str) -> dict:
+    """
+    For the given trading day return a dict mapping each of the four file types
+    to a bool indicating whether it already exists in OSS.
+    """
+    date_str = trading_day.strftime("%Y%m%d")
+    return {
+        name: _oss_object_exists(bucket, f"{oss_prefix}{date_str}_{name}.parquet")
+        for name in DAILY_BASIC_FILE_TYPES
+    }
+
+
+def _upload_df_to_oss(bucket, df: pd.DataFrame, oss_key: str) -> None:
+    """Serialise *df* as parquet in memory and upload to OSS."""
+    buf = io.BytesIO()
+    df.to_parquet(buf, index=False, engine="pyarrow")
+    buf.seek(0)
+    bucket.put_object(oss_key, buf.read())
+    g_logger.info(f"Uploaded to OSS: {oss_key}  rows={len(df)}")
+
+
+def _fetch_daily_basic_data(conn, trading_day: pd.Timestamp):
+    """
+    Run the three SQL queries for *trading_day* and return four DataFrames:
+      df_equity      — per-stock OHLCV + market-cap (mkt_equd × mkt_equd_adj_af)
+      df_exposure    — per-stock SW2021 industry-factor exposure (dy1d_exposure_sw21)
+      df_daily       — df_equity left-joined with df_exposure (the main combined file)
+      df_mkt_idx     — CSI index daily data (mkt_idxd_csi)
+    """
+    date_str = trading_day.strftime("%Y-%m-%d")
+
+    sql_equity = f"""
+    SELECT
+        t1.TRADE_DATE        AS TS,
+        t1.TICKER_SYMBOL     AS ID_QI,
+        t2.OPEN_PRICE_2      AS open,
+        t2.HIGHEST_PRICE     AS high,
+        t2.LOWEST_PRICE      AS low,
+        t2.CLOSE_PRICE       AS close,
+        t2.OPEN_PRICE_2      AS adj_open,
+        t2.CLOSE_PRICE_2     AS adj_close,
+        t2.HIGHEST_PRICE_2   AS adj_high,
+        t2.LOWEST_PRICE_2    AS adj_low,
+        t2.PRE_CLOSE_PRICE_2 AS adj_pre_close,
+        t1.DEAL_AMOUNT       AS deal_amount,
+        t1.TURNOVER_VOL      AS volume,
+        t1.TURNOVER_VALUE    AS amount,
+        t1.MARKET_VALUE      AS mkt_cap,
+        t1.NEG_MARKET_VALUE  AS float_mkt_cap,
+        t1.TURNOVER_RATE     AS turnover_rate,
+        t1.PE                AS pe_ttm,
+        t1.PB                AS pb
+    FROM mkt_equd t1
+    JOIN mkt_equd_adj_af t2
+        ON  t1.SECURITY_ID = t2.SECURITY_ID
+        AND t1.TRADE_DATE  = t2.TRADE_DATE
+    WHERE t1.TRADE_DATE   = '{date_str}'
+      AND t1.EXCHANGE_CD IN ('XSHG', 'XSHE')
+    ORDER BY t1.TICKER_SYMBOL
+    """
+
+    sql_exposure = f"""
+    SELECT *
+    FROM dy1d_exposure_sw21
+    WHERE TRADE_DATE = '{date_str}'
+    """
+
+    sql_mkt_idx = f"""
+    SELECT
+        TRADE_DATE           AS TS,
+        TICKER_SYMBOL        AS index_code,
+        CLOSE_INDEX          AS close,
+        CHG_PCT / 100.0      AS mkt_ret,
+        TURNOVER_VOL         AS volume
+    FROM mkt_idxd_csi
+    WHERE TRADE_DATE = '{date_str}'
+    """
+
+    df_equity   = pd.read_sql(sql_equity,   conn)
+    df_exposure = pd.read_sql(sql_exposure, conn)
+    df_mkt_idx  = pd.read_sql(sql_mkt_idx,  conn)
+
+    # Merge per-stock equity data with industry-factor exposure
+    df_daily = df_equity.merge(
+        df_exposure,
+        left_on=["TS", "ID_QI"],
+        right_on=["TRADE_DATE", "TICKER_SYMBOL"],
+        how="left",
+    )
+    df_daily.drop(columns=["TRADE_DATE", "TICKER_SYMBOL"], errors="ignore", inplace=True)
+
+    return df_equity, df_exposure, df_daily, df_mkt_idx
+
+
+def _generate_and_upload_day(
+    trading_day: pd.Timestamp,
+    conn,
+    bucket,
+    oss_prefix: str,
+) -> None:
+    """
+    For a single trading day:
+      1. Check which of the four parquet files already exist in OSS.
+      2. If all four exist → skip.
+      3. Otherwise fetch the missing data via SQL and upload.
+    """
+    date_str = trading_day.strftime("%Y%m%d")
+    file_status = _check_day_files_in_oss(bucket, trading_day, oss_prefix)
+
+    if all(file_status.values()):
+        g_logger.info(f"[{date_str}] All 4 daily-basic files already in OSS — skipping")
+        return
+
+    missing = [k for k, v in file_status.items() if not v]
+    g_logger.info(f"[{date_str}] Missing files in OSS: {missing} — fetching from DB")
+
+    try:
+        df_equity, df_exposure, df_daily, df_mkt_idx = _fetch_daily_basic_data(conn, trading_day)
+    except Exception as e:
+        g_logger.error(f"[{date_str}] SQL fetch failed: {e}")
+        return
+
+    upload_map = {
+        "equity_data":    df_equity,
+        "exposure_sw21":  df_exposure,
+        "daily_basic_data": df_daily,
+        "mkt_idx":        df_mkt_idx,
+    }
+
+    for file_type, df in upload_map.items():
+        if file_status[file_type]:
+            continue
+        if df is None or df.empty:
+            g_logger.warning(f"[{date_str}] DataFrame for '{file_type}' is empty — skipping upload")
+            continue
+        oss_key = f"{oss_prefix}{date_str}_{file_type}.parquet"
+        try:
+            _upload_df_to_oss(bucket, df, oss_key)
+        except Exception as e:
+            g_logger.error(f"[{date_str}] Upload failed for '{file_type}': {e}")
+
+
+def convert_basic_data_monthly(
+    trading_month: str,
+    oss_prefix: Optional[str] = None,
+) -> None:
+    """
+    Entry point: generate daily-basic-data parquets for every trading day in
+    *trading_month* (format ``YYYY.MM``) and upload them to OSS.
+
+    Four parquet files are produced per day:
+      ``{YYYYMMDD}_equity_data.parquet``      — stock OHLCV + market-cap
+      ``{YYYYMMDD}_exposure_sw21.parquet``    — SW2021 industry-factor exposure
+      ``{YYYYMMDD}_daily_basic_data.parquet`` — equity merged with exposure (main file)
+      ``{YYYYMMDD}_mkt_idx.parquet``          — CSI market-index daily data
+
+    Days whose four files are already present in OSS are skipped automatically.
+
+    Args:
+        trading_month: Target month in ``YYYY.MM`` format, e.g. ``"2024.01"``.
+        oss_prefix:    OSS key prefix (directory) for the parquet files.
+                       Defaults to the ``OSS_BASIC_DATA_PREFIX`` env variable.
+    """
+    try:
+        datetime.datetime.strptime(trading_month, "%Y.%m")
+    except ValueError:
+        raise ValueError(
+            f"Invalid trading_month '{trading_month}'. Expected format: YYYY.MM  e.g. '2024.01'"
+        )
+
+    if oss_prefix is None:
+        oss_prefix = OSS_BASIC_DATA_PREFIX
+
+    my_db  = MySQLDB()
+    bucket = _get_oss_bucket()
+
+    # Retrieve trading days that belong to the requested month
+    all_trade_days  = my_db.get_all_trade_days()
+    trading_days    = all_trade_days[
+        all_trade_days.map(lambda x: x.strftime("%Y.%m") == trading_month)
+    ].sort_values()
+
+    if len(trading_days) == 0:
+        g_logger.warning(f"No trading days found for month '{trading_month}'")
+        return
+
+    g_logger.info(
+        f"convert_basic_data_monthly: month={trading_month}  "
+        f"trading_days={len(trading_days)}  oss_prefix={oss_prefix}"
+    )
+
+    # Use a SQLAlchemy engine from MySQLDB for pd.read_sql compatibility
+    engine = my_db.get_engine()
+    with engine.connect() as conn:
+        for trading_day in trading_days:
+            _generate_and_upload_day(trading_day, conn, bucket, oss_prefix)
+
+    g_logger.info(f"convert_basic_data_monthly: finished month={trading_month}")
