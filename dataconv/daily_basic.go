@@ -1,0 +1,352 @@
+package dataconv
+
+import (
+	"database/sql"
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"deeptrade/storage"
+
+	"github.com/apache/arrow/go/v17/arrow"
+	"github.com/apache/arrow/go/v17/arrow/array"
+	"github.com/apache/arrow/go/v17/arrow/memory"
+	parquetlib "github.com/apache/arrow/go/v17/parquet"
+	"github.com/apache/arrow/go/v17/parquet/compress"
+	"github.com/apache/arrow/go/v17/parquet/pqarrow"
+)
+
+// DailyBasicConfig daily basic data 生成配置
+type DailyBasicConfig struct {
+	TradingDay time.Time
+	OutputDir  string
+	OSSConfig  *OSSConfig // nil 表示不上传
+}
+
+// GenerateDailyBasicData 为指定交易日生成四份 Parquet 文件并（可选）上传 OSS。
+//
+// 生成的文件：
+//
+//	{YYYYMMDD}_equity_data.parquet       —— 股票 OHLCV + 市值（mkt_equd × mkt_equd_adj_af）
+//	{YYYYMMDD}_exposure_sw21.parquet     —— 申万2021行业因子暴露（dy1d_exposure_sw21）
+//	{YYYYMMDD}_daily_basic_data.parquet  —— equity LEFT JOIN exposure 合并主文件
+//	{YYYYMMDD}_mkt_idx.parquet           —— 中证指数日行情（mkt_idxd_csi）
+//
+// 返回成功写入（含上传）的文件数量。
+func GenerateDailyBasicData(cfg DailyBasicConfig) (int, error) {
+	db, err := storage.GetMySQLClient()
+	if err != nil {
+		return 0, fmt.Errorf("MySQL连接失败: %w", err)
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		return 0, fmt.Errorf("获取sql.DB失败: %w", err)
+	}
+
+	if err := os.MkdirAll(cfg.OutputDir, 0755); err != nil {
+		return 0, fmt.Errorf("创建输出目录失败: %w", err)
+	}
+
+	var uploader *OSSUploader
+	if cfg.OSSConfig != nil {
+		uploader, err = NewOSSUploader(*cfg.OSSConfig)
+		if err != nil {
+			log.Printf("[daily_basic] OSS初始化失败，跳过上传: %v", err)
+		}
+	}
+
+	dateStr    := cfg.TradingDay.Format("20060102")
+	dateFilter := cfg.TradingDay.Format("2006-01-02")
+	generated  := 0
+
+	type task struct {
+		filename string
+		query    string
+	}
+
+	// 构建 daily_basic_data 的 JOIN 查询：动态获取 exposure 列避免列名冲突
+	dailySQL, err := buildDailyBasicSQL(sqlDB, dateFilter)
+	if err != nil {
+		log.Printf("[daily_basic] 构建 daily_basic_data SQL 失败: %v，将仅写入 equity 数据", err)
+		dailySQL = buildEquitySQL(dateFilter)
+	}
+
+	tasks := []task{
+		{
+			filename: dateStr + "_equity_data.parquet",
+			query:    buildEquitySQL(dateFilter),
+		},
+		{
+			filename: dateStr + "_exposure_sw21.parquet",
+			query:    fmt.Sprintf("SELECT * FROM dy1d_exposure_sw21 WHERE TRADE_DATE = '%s'", dateFilter),
+		},
+		{
+			filename: dateStr + "_daily_basic_data.parquet",
+			query:    dailySQL,
+		},
+		{
+			filename: dateStr + "_mkt_idx.parquet",
+			query: fmt.Sprintf(`
+SELECT
+    TRADE_DATE      AS TS,
+    TICKER_SYMBOL   AS index_code,
+    CLOSE_INDEX     AS close,
+    CHG_PCT / 100.0 AS mkt_ret,
+    TURNOVER_VOL    AS volume
+FROM mkt_idxd_csi
+WHERE TRADE_DATE = '%s'`, dateFilter),
+		},
+	}
+
+	for _, t := range tasks {
+		outputPath := filepath.Join(cfg.OutputDir, t.filename)
+		n, err := writeQueryToParquet(sqlDB, t.query, outputPath)
+		if err != nil {
+			log.Printf("[daily_basic][%s] 写入失败: %v", t.filename, err)
+			continue
+		}
+		log.Printf("[daily_basic][%s] 写入成功: %d 行", t.filename, n)
+		generated++
+
+		if uploader != nil {
+			ossKey := uploader.BuildFilePath(cfg.TradingDay, t.filename)
+			if err := uploader.UploadLocalFile(outputPath, ossKey); err != nil {
+				log.Printf("[daily_basic][%s] OSS上传失败: %v", t.filename, err)
+			}
+		}
+	}
+
+	return generated, nil
+}
+
+// buildEquitySQL 构建股票行情+市值查询
+func buildEquitySQL(dateFilter string) string {
+	return fmt.Sprintf(`
+SELECT
+    t1.TRADE_DATE        AS TS,
+    t1.TICKER_SYMBOL     AS ID_QI,
+    t2.OPEN_PRICE_2      AS open,
+    t2.HIGHEST_PRICE     AS high,
+    t2.LOWEST_PRICE      AS low,
+    t2.CLOSE_PRICE       AS close,
+    t2.OPEN_PRICE_2      AS adj_open,
+    t2.CLOSE_PRICE_2     AS adj_close,
+    t2.HIGHEST_PRICE_2   AS adj_high,
+    t2.LOWEST_PRICE_2    AS adj_low,
+    t2.PRE_CLOSE_PRICE_2 AS adj_pre_close,
+    t1.DEAL_AMOUNT       AS deal_amount,
+    t1.TURNOVER_VOL      AS volume,
+    t1.TURNOVER_VALUE    AS amount,
+    t1.MARKET_VALUE      AS mkt_cap,
+    t1.NEG_MARKET_VALUE  AS float_mkt_cap,
+    t1.TURNOVER_RATE     AS turnover_rate,
+    t1.PE                AS pe_ttm,
+    t1.PB                AS pb
+FROM mkt_equd t1
+JOIN mkt_equd_adj_af t2
+    ON  t1.SECURITY_ID = t2.SECURITY_ID
+    AND t1.TRADE_DATE  = t2.TRADE_DATE
+WHERE t1.TRADE_DATE   = '%s'
+  AND t1.EXCHANGE_CD IN ('XSHG', 'XSHE')
+ORDER BY t1.TICKER_SYMBOL`, dateFilter)
+}
+
+// buildDailyBasicSQL 构建 equity LEFT JOIN exposure 的合并查询。
+// 先查询 exposure 表的列名，排除 key 列后拼接进 SELECT，避免列名重复。
+func buildDailyBasicSQL(db *sql.DB, dateFilter string) (string, error) {
+	rows, err := db.Query("SHOW COLUMNS FROM dy1d_exposure_sw21")
+	if err != nil {
+		return "", fmt.Errorf("SHOW COLUMNS 失败: %w", err)
+	}
+	defer rows.Close()
+
+	skipCols := map[string]bool{
+		"TRADE_DATE": true, "TICKER_SYMBOL": true, "SECURITY_ID": true,
+	}
+	var expCols []string
+	for rows.Next() {
+		var field, colType, null, key, defVal, extra sql.NullString
+		if err := rows.Scan(&field, &colType, &null, &key, &defVal, &extra); err != nil {
+			continue
+		}
+		colName := strings.ToUpper(field.String)
+		if !skipCols[colName] {
+			expCols = append(expCols, fmt.Sprintf("    e.%s", field.String))
+		}
+	}
+
+	expSelect := ""
+	if len(expCols) > 0 {
+		expSelect = ",\n" + strings.Join(expCols, ",\n")
+	}
+
+	return fmt.Sprintf(`
+SELECT
+    t1.TRADE_DATE        AS TS,
+    t1.TICKER_SYMBOL     AS ID_QI,
+    t2.OPEN_PRICE_2      AS open,
+    t2.HIGHEST_PRICE     AS high,
+    t2.LOWEST_PRICE      AS low,
+    t2.CLOSE_PRICE       AS close,
+    t2.OPEN_PRICE_2      AS adj_open,
+    t2.CLOSE_PRICE_2     AS adj_close,
+    t2.HIGHEST_PRICE_2   AS adj_high,
+    t2.LOWEST_PRICE_2    AS adj_low,
+    t2.PRE_CLOSE_PRICE_2 AS adj_pre_close,
+    t1.DEAL_AMOUNT       AS deal_amount,
+    t1.TURNOVER_VOL      AS volume,
+    t1.TURNOVER_VALUE    AS amount,
+    t1.MARKET_VALUE      AS mkt_cap,
+    t1.NEG_MARKET_VALUE  AS float_mkt_cap,
+    t1.TURNOVER_RATE     AS turnover_rate,
+    t1.PE                AS pe_ttm,
+    t1.PB                AS pb%s
+FROM mkt_equd t1
+JOIN mkt_equd_adj_af t2
+    ON  t1.SECURITY_ID = t2.SECURITY_ID
+    AND t1.TRADE_DATE  = t2.TRADE_DATE
+LEFT JOIN dy1d_exposure_sw21 e
+    ON  t1.TICKER_SYMBOL = e.TICKER_SYMBOL
+    AND t1.TRADE_DATE    = e.TRADE_DATE
+WHERE t1.TRADE_DATE   = '%s'
+  AND t1.EXCHANGE_CD IN ('XSHG', 'XSHE')
+ORDER BY t1.TICKER_SYMBOL`, expSelect, dateFilter), nil
+}
+
+// writeQueryToParquet 执行 SQL 查询并将结果写入 Parquet 文件。
+// 列类型由 MySQL 返回的元数据动态推断：字符/日期类型 → String，其余 → Float64。
+// 重复列名会自动追加 _2 / _3 … 后缀。
+// 返回写入的行数。
+func writeQueryToParquet(db *sql.DB, query, outputPath string) (int, error) {
+	rows, err := db.Query(query)
+	if err != nil {
+		return 0, fmt.Errorf("执行SQL失败: %w", err)
+	}
+	defer rows.Close()
+
+	colTypes, err := rows.ColumnTypes()
+	if err != nil {
+		return 0, fmt.Errorf("获取列类型失败: %w", err)
+	}
+
+	// 推断 Arrow 列类型，并处理重复列名
+	fields   := make([]arrow.Field, len(colTypes))
+	isString := make([]bool, len(colTypes))
+	seenNames := make(map[string]int, len(colTypes))
+
+	for i, ct := range colTypes {
+		name := ct.Name()
+		if count, ok := seenNames[name]; ok {
+			seenNames[name]++
+			name = fmt.Sprintf("%s_%d", name, count+1)
+		} else {
+			seenNames[name] = 1
+		}
+
+		switch ct.DatabaseTypeName() {
+		case "VARCHAR", "CHAR", "TEXT", "LONGTEXT", "MEDIUMTEXT",
+			"DATE", "DATETIME", "TIMESTAMP", "TIME", "YEAR":
+			fields[i]   = arrow.Field{Name: name, Type: arrow.BinaryTypes.String, Nullable: true}
+			isString[i] = true
+		default:
+			fields[i] = arrow.Field{Name: name, Type: arrow.PrimitiveTypes.Float64, Nullable: true}
+		}
+	}
+
+	schema  := arrow.NewSchema(fields, nil)
+	builder := array.NewRecordBuilder(memory.DefaultAllocator, schema)
+	defer builder.Release()
+
+	vals := make([]interface{}, len(colTypes))
+	ptrs := make([]interface{}, len(colTypes))
+	for i := range vals {
+		ptrs[i] = &vals[i]
+	}
+
+	rowCount := 0
+	for rows.Next() {
+		if err := rows.Scan(ptrs...); err != nil {
+			return rowCount, fmt.Errorf("扫描行失败 (row %d): %w", rowCount, err)
+		}
+		for i, v := range vals {
+			if isString[i] {
+				b := builder.Field(i).(*array.StringBuilder)
+				if v == nil {
+					b.AppendNull()
+				} else {
+					b.Append(fmt.Sprintf("%v", v))
+				}
+			} else {
+				b := builder.Field(i).(*array.Float64Builder)
+				if v == nil {
+					b.AppendNull()
+				} else {
+					appendFloat64(b, v)
+				}
+			}
+		}
+		rowCount++
+	}
+	if err := rows.Err(); err != nil {
+		return rowCount, err
+	}
+	if rowCount == 0 {
+		return 0, fmt.Errorf("查询结果为空")
+	}
+
+	rec := builder.NewRecord()
+	defer rec.Release()
+
+	f, err := os.Create(outputPath)
+	if err != nil {
+		return rowCount, fmt.Errorf("创建文件失败: %w", err)
+	}
+	defer f.Close()
+
+	props  := parquetlib.NewWriterProperties(parquetlib.WithCompression(compress.Codecs.Snappy))
+	writer, err := pqarrow.NewFileWriter(schema, f, props, pqarrow.DefaultWriterProps())
+	if err != nil {
+		return rowCount, fmt.Errorf("创建Parquet写入器失败: %w", err)
+	}
+	if err := writer.Write(rec); err != nil {
+		writer.Close()
+		return rowCount, fmt.Errorf("写入Parquet失败: %w", err)
+	}
+	writer.Close()
+
+	return rowCount, nil
+}
+
+// appendFloat64 将 SQL 扫描到的任意数值类型追加到 Float64Builder
+func appendFloat64(b *array.Float64Builder, v interface{}) {
+	switch tv := v.(type) {
+	case float64:
+		b.Append(tv)
+	case float32:
+		b.Append(float64(tv))
+	case int64:
+		b.Append(float64(tv))
+	case int32:
+		b.Append(float64(tv))
+	case int:
+		b.Append(float64(tv))
+	case []byte:
+		if f, err := strconv.ParseFloat(string(tv), 64); err == nil {
+			b.Append(f)
+		} else {
+			b.AppendNull()
+		}
+	case string:
+		if f, err := strconv.ParseFloat(tv, 64); err == nil {
+			b.Append(f)
+		} else {
+			b.AppendNull()
+		}
+	default:
+		b.AppendNull()
+	}
+}

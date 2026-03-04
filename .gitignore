@@ -20,9 +20,7 @@ deeptrade
 output
 output/
 output_test
-output_test/
-
-# 编译的二进制文件
+output_test/# 编译的二进制文件
 data-converter
 cmd/data-converter/data-converter
 

@@ -60,6 +60,10 @@ var (
 	flagEndDate   = flag.String("end-date", "", "结束日期 (格式: 20251231)")
 	flagResume    = flag.Bool("resume", false, "断点续传模式")
 	flagFlushDaily = flag.Bool("flush-daily", true, "每天处理完立即写入Parquet")
+
+	// daily basic data 参数
+	flagDailyBasic      = flag.Bool("daily-basic", false, "生成每日基础数据 Parquet (equity/exposure/mkt_idx/daily_basic_data)")
+	flagDailyBasicSkipOSS = flag.Bool("daily-basic-skip-oss-check", false, "跳过 OSS 存在检查，强制重新生成 daily basic data")
 )
 
 func main() {
@@ -77,10 +81,15 @@ func main() {
 	debug.SetGCPercent(50)
 	log.Println("[优化] GC百分比设置为50% (更频繁回收)")
 
-	// 判断是批量处理还是单日处理
-	if *flagAutoDownload && (*flagYear > 0 || *flagStartDate != "") {
+	// 判断运行模式
+	switch {
+	case *flagAutoDownload && (*flagYear > 0 || *flagStartDate != ""):
+		// 自动下载 + 批量处理（原有逻辑）
 		runBatchMode()
-	} else {
+	case *flagDailyBasic && (*flagYear > 0 || *flagStartDate != ""):
+		// 仅生成 daily basic data（不需要下载原始数据）
+		runDailyBasicMonthMode()
+	default:
 		runSingleDayMode()
 	}
 }
@@ -220,7 +229,21 @@ func runBatchMode() {
 
 func processSingleDay(date time.Time, downloader *dataconv.Downloader) error {
 	dayStart := time.Now()
-	
+
+	// 0. 若启用 OSS 且未跳过检查，先判断四个 Parquet 是否均已存在
+	if *flagOSS && !*flagDailyBasicSkipOSS {
+		ossConfig := getOSSConfig()
+		if ossConfig != nil {
+			if uploader, err := dataconv.NewOSSUploader(*ossConfig); err == nil {
+				if uploader.AllDayFilesExist(date) {
+					log.Printf("[跳过] %s 的四个 Parquet 文件已全部在 OSS 中，跳过处理",
+						date.Format("2006-01-02"))
+					return nil
+				}
+			}
+		}
+	}
+
 	// 1. 获取文件列表
 	log.Printf("[检查] 查询文件列表...")
 	files, err := downloader.ListDayFiles(date)
@@ -380,14 +403,29 @@ func processSingleDay(date time.Time, downloader *dataconv.Downloader) error {
 			return fmt.Errorf("写入Parquet失败: %w", err)
 		}
 		log.Printf("[写入] 完成 ✓")
-		
-		// 6. OSS上传并清理
+
+		// 6. 生成 daily basic data（equity / exposure / mkt_idx / daily_basic_data）
+		if *flagDailyBasic {
+			log.Printf("[daily_basic] 开始生成 %s 的每日基础数据...", date.Format("2006-01-02"))
+			n, err := dataconv.GenerateDailyBasicData(dataconv.DailyBasicConfig{
+				TradingDay: date,
+				OutputDir:  *flagOutputDir,
+				OSSConfig:  getOSSConfig(),
+			})
+			if err != nil {
+				log.Printf("[daily_basic] 生成失败: %v", err)
+			} else {
+				log.Printf("[daily_basic] 成功生成 %d 个文件 ✓", n)
+			}
+		}
+
+		// 7. OSS上传后清理本地 Parquet
 		if *flagOSS && *flagOSSCleanLocal {
 			log.Printf("[清理] 删除本地Parquet文件...")
 			cleanLocalParquetFiles(*flagOutputDir, date)
 		}
 	}
-	
+
 	log.Printf("[完成] %s - 耗时: %v", date.Format("2006-01-02"), time.Since(dayStart))
 	return nil
 }
@@ -704,6 +742,93 @@ func parseTradingDay(s string) (time.Time, error) {
 	}
 
 	return time.Time{}, fmt.Errorf("无法解析日期: %s (支持格式: 2024-01-02 或 20240102)", s)
+}
+
+// runDailyBasicMonthMode 仅生成 daily basic data，不需要下载原始数据。
+// 支持 -year/-month 或 -start-date/-end-date 指定日期范围。
+// 每天处理前先检查 OSS，四个文件均已存在则跳过（除非 -daily-basic-skip-oss-check）。
+func runDailyBasicMonthMode() {
+	log.Println("[模式] Daily Basic Data 月份生成")
+
+	dates, err := generateDateRange()
+	if err != nil {
+		log.Fatalf("生成日期范围失败: %v", err)
+	}
+
+	log.Printf("[配置] 日期范围: %s ~ %s (共 %d 天)",
+		dates[0].Format("2006-01-02"),
+		dates[len(dates)-1].Format("2006-01-02"),
+		len(dates))
+	log.Printf("[配置] 输出目录: %s", *flagOutputDir)
+	if *flagOSS {
+		log.Printf("[配置] OSS上传: 启用")
+	}
+	log.Println("========================================")
+
+	if err := os.MkdirAll(*flagOutputDir, 0755); err != nil {
+		log.Fatalf("创建输出目录失败: %v", err)
+	}
+
+	ossConfig := getOSSConfig()
+	var uploader *dataconv.OSSUploader
+	if ossConfig != nil {
+		uploader, err = dataconv.NewOSSUploader(*ossConfig)
+		if err != nil {
+			log.Printf("[警告] OSS初始化失败，将跳过存在检查和上传: %v", err)
+			uploader = nil
+		}
+	}
+
+	// 初始化MySQL（daily basic data 必须用 MySQL）
+	if _, err := storage.GetMySQLClient(); err != nil {
+		log.Fatalf("MySQL连接失败，daily basic data 无法生成: %v", err)
+	}
+	defer storage.CloseMySQL()
+
+	totalStart := time.Now()
+	var successDays, skipDays, failDays int
+
+	for i, date := range dates {
+		dateStr := date.Format("20060102")
+		log.Printf("\n[%d/%d] %s", i+1, len(dates), date.Format("2006-01-02"))
+
+		// 检查 OSS：四个文件都存在则跳过
+		if uploader != nil && !*flagDailyBasicSkipOSS {
+			if uploader.AllDayFilesExist(date) {
+				log.Printf("[跳过] OSS 中已存在四个 Parquet 文件")
+				skipDays++
+				continue
+			}
+			// 输出缺失的文件名
+			for _, name := range dataconv.DailyParquetFileNames(date) {
+				ossKey := uploader.BuildFilePath(date, name)
+				if !uploader.ObjectExists(ossKey) {
+					log.Printf("[缺失] %s", name)
+				}
+			}
+		}
+
+		n, err := dataconv.GenerateDailyBasicData(dataconv.DailyBasicConfig{
+			TradingDay: date,
+			OutputDir:  *flagOutputDir,
+			OSSConfig:  ossConfig,
+		})
+		if err != nil {
+			log.Printf("[失败] %s: %v", dateStr, err)
+			failDays++
+			continue
+		}
+		log.Printf("[完成] %s — 生成 %d 个文件", dateStr, n)
+		successDays++
+	}
+
+	log.Println("\n========================================")
+	log.Println("[总结] Daily Basic Data 生成完成")
+	log.Printf("  - 成功: %d 天", successDays)
+	log.Printf("  - 跳过: %d 天 (OSS已存在)", skipDays)
+	log.Printf("  - 失败: %d 天", failDays)
+	log.Printf("  - 总耗时: %v", time.Since(totalStart))
+	log.Println("========================================")
 }
 
 // findDataFile 查找数据文件
