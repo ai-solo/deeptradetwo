@@ -312,78 +312,70 @@ func (w *OptParquetWriter) writeOrdersToParquet(orders []Order, filename string)
 }
 
 // checkAndConvertOrder 检测并转换 Order 数据
+// 先验证全部字段，验证通过后再统一 Append，避免列长度不一致导致 panic
 func (w *OptParquetWriter) checkAndConvertOrder(order Order, builder *array.RecordBuilder) error {
-	idx := 0
-
-	// Code: String -> Int32 (SECURITY_ID)
+	// --- 第一步：计算并验证所有字段 ---
 	codeID, err := w.securityCache.GetIDWithDate(order.Code, w.tradingDay)
 	if err != nil {
 		return fmt.Errorf("获取 SECURITY_ID 失败 [%s]: %w", order.Code, err)
 	}
-	builder.Field(idx).(*array.Int32Builder).Append(codeID)
-	idx++
 
-	// Time: Time -> Int64 (UnixMicro)
-	builder.Field(idx).(*array.Int64Builder).Append(order.Time.UnixMicro())
-	idx++
+	timeUnix := order.Time.UnixMicro()
 
-	// UpdateTime: Time -> Int32 (微秒偏移)
 	offset := order.UpdateTime.Sub(order.Time).Microseconds()
 	if !w.forceInt32 && w.rangeChecker != nil {
 		if err := w.rangeChecker.CheckUpdateTimeOffset("UpdateTime偏移", offset, order.Code, order); err != nil {
 			return err
 		}
 	}
-	builder.Field(idx).(*array.Int32Builder).Append(int32(offset))
-	idx++
 
-	// OrderID: Int64 -> Int32
 	orderID := int32(order.OrderID)
 	if !w.forceInt32 && w.rangeChecker != nil {
 		if err := w.rangeChecker.CheckInt32("OrderID", int64(orderID), order.Code, order); err != nil {
 			return err
 		}
 	}
-	builder.Field(idx).(*array.Int32Builder).Append(orderID)
-	idx++
 
-	// Side: Int16 -> Int8
-	builder.Field(idx).(*array.Int8Builder).Append(int8(order.Side))
-	idx++
-
-	// Price: Float64 -> Int32 (×100)
 	priceInt := int32(order.Price * 100)
 	if !w.forceInt32 && w.rangeChecker != nil {
 		if err := w.rangeChecker.CheckInt32("Price", int64(priceInt), order.Code, order); err != nil {
 			return err
 		}
 	}
-	builder.Field(idx).(*array.Int32Builder).Append(priceInt)
-	idx++
 
-	// Volume: Float64 -> Int32 (÷100)
 	volumeInt := int32(order.Volume / 100)
 	if !w.forceInt32 && w.rangeChecker != nil {
 		if err := w.rangeChecker.CheckInt32("Volume", int64(volumeInt), order.Code, order); err != nil {
 			return err
 		}
 	}
-	builder.Field(idx).(*array.Int32Builder).Append(volumeInt)
-	idx++
 
-	// OrderType: Int16 -> Int8
-	builder.Field(idx).(*array.Int8Builder).Append(int8(order.OrderType))
-	idx++
-
-	// SeqNum: Int64 -> Int32
 	seqNum := int32(order.SeqNum)
 	if !w.forceInt32 && w.rangeChecker != nil {
 		if err := w.rangeChecker.CheckInt32("SeqNum", int64(seqNum), order.Code, order); err != nil {
 			return err
 		}
 	}
-	builder.Field(idx).(*array.Int32Builder).Append(seqNum)
+
+	// --- 第二步：全部验证通过，统一 Append ---
+	idx := 0
+	builder.Field(idx).(*array.Int32Builder).Append(codeID)
 	idx++
+	builder.Field(idx).(*array.Int64Builder).Append(timeUnix)
+	idx++
+	builder.Field(idx).(*array.Int32Builder).Append(int32(offset))
+	idx++
+	builder.Field(idx).(*array.Int32Builder).Append(orderID)
+	idx++
+	builder.Field(idx).(*array.Int8Builder).Append(int8(order.Side))
+	idx++
+	builder.Field(idx).(*array.Int32Builder).Append(priceInt)
+	idx++
+	builder.Field(idx).(*array.Int32Builder).Append(volumeInt)
+	idx++
+	builder.Field(idx).(*array.Int8Builder).Append(int8(order.OrderType))
+	idx++
+	builder.Field(idx).(*array.Int32Builder).Append(seqNum)
 
 	return nil
 }
@@ -450,84 +442,77 @@ func (w *OptParquetWriter) writeDealsToParquet(deals []Deal, filename string) er
 }
 
 // checkAndConvertDeal 检测并转换 Deal 数据
+// 先验证全部字段，验证通过后再统一 Append，避免列长度不一致导致 panic
 func (w *OptParquetWriter) checkAndConvertDeal(deal Deal, builder *array.RecordBuilder) error {
-	idx := 0
-
-	// Code: String -> Int32
+	// --- 第一步：计算并验证所有字段 ---
 	codeID, err := w.securityCache.GetIDWithDate(deal.Code, w.tradingDay)
 	if err != nil {
 		return fmt.Errorf("获取 SECURITY_ID 失败 [%s]: %w", deal.Code, err)
 	}
-	builder.Field(idx).(*array.Int32Builder).Append(codeID)
-	idx++
 
-	// Time
-	builder.Field(idx).(*array.Int64Builder).Append(deal.Time.UnixMicro())
-	idx++
+	timeUnix := deal.Time.UnixMicro()
 
-	// UpdateTime
 	offset := deal.UpdateTime.Sub(deal.Time).Microseconds()
 	if !w.forceInt32 && w.rangeChecker != nil {
 		if err := w.rangeChecker.CheckUpdateTimeOffset("UpdateTime偏移", offset, deal.Code, deal); err != nil {
 			return err
 		}
 	}
-	builder.Field(idx).(*array.Int32Builder).Append(int32(offset))
-	idx++
 
-	// SaleOrderID: Int64 -> Int32
 	saleOrderID := int32(deal.SaleOrderID)
 	if !w.forceInt32 && w.rangeChecker != nil {
 		if err := w.rangeChecker.CheckInt32("SaleOrderID", int64(saleOrderID), deal.Code, deal); err != nil {
 			return err
 		}
 	}
-	builder.Field(idx).(*array.Int32Builder).Append(saleOrderID)
-	idx++
 
-	// BuyOrderID: Int64 -> Int32
 	buyOrderID := int32(deal.BuyOrderID)
 	if !w.forceInt32 && w.rangeChecker != nil {
 		if err := w.rangeChecker.CheckInt32("BuyOrderID", int64(buyOrderID), deal.Code, deal); err != nil {
 			return err
 		}
 	}
-	builder.Field(idx).(*array.Int32Builder).Append(buyOrderID)
-	idx++
 
-	// Side: Int16 -> Int8
-	builder.Field(idx).(*array.Int8Builder).Append(int8(deal.Side))
-	idx++
-
-	// Price: Float64 -> Int32
 	priceInt := int32(deal.Price * 100)
 	if !w.forceInt32 && w.rangeChecker != nil {
 		if err := w.rangeChecker.CheckInt32("Price", int64(priceInt), deal.Code, deal); err != nil {
 			return err
 		}
 	}
-	builder.Field(idx).(*array.Int32Builder).Append(priceInt)
-	idx++
 
-	// Volume: Float64 -> Int32
 	volumeInt := int32(deal.Volume / 100)
 	if !w.forceInt32 && w.rangeChecker != nil {
 		if err := w.rangeChecker.CheckInt32("Volume", int64(volumeInt), deal.Code, deal); err != nil {
 			return err
 		}
 	}
-	builder.Field(idx).(*array.Int32Builder).Append(volumeInt)
-	idx++
 
-	// SeqNum: Int64 -> Int32
 	seqNum := int32(deal.SeqNum)
 	if !w.forceInt32 && w.rangeChecker != nil {
 		if err := w.rangeChecker.CheckInt32("SeqNum", int64(seqNum), deal.Code, deal); err != nil {
 			return err
 		}
 	}
-	builder.Field(idx).(*array.Int32Builder).Append(seqNum)
+
+	// --- 第二步：全部验证通过，统一 Append ---
+	idx := 0
+	builder.Field(idx).(*array.Int32Builder).Append(codeID)
 	idx++
+	builder.Field(idx).(*array.Int64Builder).Append(timeUnix)
+	idx++
+	builder.Field(idx).(*array.Int32Builder).Append(int32(offset))
+	idx++
+	builder.Field(idx).(*array.Int32Builder).Append(saleOrderID)
+	idx++
+	builder.Field(idx).(*array.Int32Builder).Append(buyOrderID)
+	idx++
+	builder.Field(idx).(*array.Int8Builder).Append(int8(deal.Side))
+	idx++
+	builder.Field(idx).(*array.Int32Builder).Append(priceInt)
+	idx++
+	builder.Field(idx).(*array.Int32Builder).Append(volumeInt)
+	idx++
+	builder.Field(idx).(*array.Int32Builder).Append(seqNum)
 
 	return nil
 }
@@ -624,33 +609,24 @@ func (w *OptParquetWriter) writeTicksToParquet(ticks []Tick, filename string) er
 }
 
 // checkAndConvertTick 检测并转换 Tick 数据
+// 先验证全部字段，验证通过后再统一 Append，避免列长度不一致导致 panic
 func (w *OptParquetWriter) checkAndConvertTick(tick Tick, builder *array.RecordBuilder) error {
-	idx := 0
-
-	// Code: String -> Int32
+	// --- 第一步：计算并验证所有字段 ---
 	codeID, err := w.securityCache.GetIDWithDate(tick.Code, w.tradingDay)
 	if err != nil {
 		return fmt.Errorf("获取 SECURITY_ID 失败 [%s]: %w", tick.Code, err)
 	}
-	builder.Field(idx).(*array.Int32Builder).Append(codeID)
-	idx++
 
-	// Time
-	builder.Field(idx).(*array.Int64Builder).Append(tick.Time.UnixMicro())
-	idx++
+	timeUnix := tick.Time.UnixMicro()
 
-	// UpdateTime
 	offset := tick.UpdateTime.Sub(tick.Time).Microseconds()
 	if !w.forceInt32 && w.rangeChecker != nil {
 		if err := w.rangeChecker.CheckUpdateTimeOffset("UpdateTime偏移", offset, tick.Code, tick); err != nil {
 			return err
 		}
 	}
-	builder.Field(idx).(*array.Int32Builder).Append(int32(offset))
-	idx++
 
-	// 价格字段 (×100)
-	priceFields := []float64{
+	priceRaws := []float64{
 		tick.CurrentPrice, tick.PreClosePrice, tick.OpenPrice,
 		tick.HighestPrice, tick.LowestPrice, tick.HighLimitPrice,
 		tick.LowLimitPrice, tick.IOPV, tick.AvgBidPrice, tick.AvgAskPrice,
@@ -659,59 +635,75 @@ func (w *OptParquetWriter) checkAndConvertTick(tick Tick, builder *array.RecordB
 		tick.BidPrice1, tick.BidPrice2, tick.BidPrice3, tick.BidPrice4, tick.BidPrice5,
 		tick.BidPrice6, tick.BidPrice7, tick.BidPrice8, tick.BidPrice9, tick.BidPrice10,
 	}
-	for _, price := range priceFields {
-		priceInt := int32(price * 100)
-		builder.Field(idx).(*array.Int32Builder).Append(priceInt)
-		idx++
+	priceInts := make([]int32, len(priceRaws))
+	for i, p := range priceRaws {
+		priceInts[i] = int32(p * 100)
 	}
 
-	// 数量字段 (÷100)
-	volumeFields := []float64{
+	volumeRaws := []float64{
 		tick.TotalVolume, tick.TotalBidVolume, tick.TotalAskVolume,
 		tick.AskVolume1, tick.AskVolume2, tick.AskVolume3, tick.AskVolume4, tick.AskVolume5,
 		tick.AskVolume6, tick.AskVolume7, tick.AskVolume8, tick.AskVolume9, tick.AskVolume10,
 		tick.BidVolume1, tick.BidVolume2, tick.BidVolume3, tick.BidVolume4, tick.BidVolume5,
 		tick.BidVolume6, tick.BidVolume7, tick.BidVolume8, tick.BidVolume9, tick.BidVolume10,
 	}
-	for _, volume := range volumeFields {
-		volumeInt := int32(volume / 100)
+	volumeInts := make([]int32, len(volumeRaws))
+	for i, v := range volumeRaws {
+		volumeInts[i] = int32(v / 100)
 		if !w.forceInt32 && w.rangeChecker != nil {
-			if err := w.rangeChecker.CheckInt32("Volume", int64(volumeInt), tick.Code, tick); err != nil {
+			if err := w.rangeChecker.CheckInt32("Volume", int64(volumeInts[i]), tick.Code, tick); err != nil {
 				return err
 			}
 		}
-		builder.Field(idx).(*array.Int32Builder).Append(volumeInt)
-		idx++
 	}
 
-	// Num 字段
-	numFields := []float64{
+	numRaws := []float64{
 		tick.TradeNum,
 		tick.AskNum1, tick.AskNum2, tick.AskNum3, tick.AskNum4, tick.AskNum5,
 		tick.AskNum6, tick.AskNum7, tick.AskNum8, tick.AskNum9, tick.AskNum10,
 		tick.BidNum1, tick.BidNum2, tick.BidNum3, tick.BidNum4, tick.BidNum5,
 		tick.BidNum6, tick.BidNum7, tick.BidNum8, tick.BidNum9, tick.BidNum10,
 	}
-	for _, num := range numFields {
-		numInt := int32(num)
+	numInts := make([]int32, len(numRaws))
+	for i, n := range numRaws {
+		numInts[i] = int32(n)
 		if !w.forceInt32 && w.rangeChecker != nil {
-			if err := w.rangeChecker.CheckInt32("Num", int64(numInt), tick.Code, tick); err != nil {
+			if err := w.rangeChecker.CheckInt32("Num", int64(numInts[i]), tick.Code, tick); err != nil {
 				return err
 			}
 		}
-		builder.Field(idx).(*array.Int32Builder).Append(numInt)
-		idx++
 	}
 
-	// SeqNum: Int64 -> Int32
 	seqNum := int32(tick.SeqNum)
 	if !w.forceInt32 && w.rangeChecker != nil {
 		if err := w.rangeChecker.CheckInt32("SeqNum", int64(seqNum), tick.Code, tick); err != nil {
 			return err
 		}
 	}
-	builder.Field(idx).(*array.Int32Builder).Append(seqNum)
+
+	// --- 第二步：全部验证通过，统一 Append ---
+	idx := 0
+	builder.Field(idx).(*array.Int32Builder).Append(codeID)
 	idx++
+	builder.Field(idx).(*array.Int64Builder).Append(timeUnix)
+	idx++
+	builder.Field(idx).(*array.Int32Builder).Append(int32(offset))
+	idx++
+
+	for _, v := range priceInts {
+		builder.Field(idx).(*array.Int32Builder).Append(v)
+		idx++
+	}
+	for _, v := range volumeInts {
+		builder.Field(idx).(*array.Int32Builder).Append(v)
+		idx++
+	}
+	for _, v := range numInts {
+		builder.Field(idx).(*array.Int32Builder).Append(v)
+		idx++
+	}
+
+	builder.Field(idx).(*array.Int32Builder).Append(seqNum)
 
 	return nil
 }
