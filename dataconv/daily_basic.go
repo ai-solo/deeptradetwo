@@ -27,16 +27,15 @@ type DailyBasicConfig struct {
 	OSSConfig  *OSSConfig // nil 表示不上传
 }
 
-// GenerateDailyBasicData 为指定交易日生成四份 Parquet 文件并（可选）上传 OSS。
+// GenerateDailyBasicData 为指定交易日生成一份 Parquet 文件并（可选）上传 OSS。
 //
 // 生成的文件：
 //
-//	{YYYYMMDD}_equity_data.parquet       —— 股票 OHLCV + 市值（mkt_equd × mkt_equd_adj_af）
-//	{YYYYMMDD}_exposure_sw21.parquet     —— 申万2021行业因子暴露（dy1d_exposure_sw21）
-//	{YYYYMMDD}_daily_basic_data.parquet  —— equity LEFT JOIN exposure 合并主文件
-//	{YYYYMMDD}_mkt_idx.parquet           —— 中证指数日行情（mkt_idxd_csi）
+//	{YYYYMMDD}_daily_basic_data.parquet
+//	    —— mkt_equd JOIN mkt_equd_adj_af LEFT JOIN dy1d_exposure_sw21 LEFT JOIN mkt_idxd_csi
+//	    —— 每行对应一只股票当日的行情、市值、因子暴露及市场指数数据
 //
-// 返回成功写入（含上传）的文件数量。
+// 返回 1（成功）或 0（失败）。
 func GenerateDailyBasicData(cfg DailyBasicConfig) (int, error) {
 	db, err := storage.GetMySQLClient()
 	if err != nil {
@@ -61,66 +60,30 @@ func GenerateDailyBasicData(cfg DailyBasicConfig) (int, error) {
 
 	dateStr    := cfg.TradingDay.Format("20060102")
 	dateFilter := cfg.TradingDay.Format("2006-01-02")
-	generated  := 0
+	filename   := dateStr + "_daily_basic_data.parquet"
+	outputPath := filepath.Join(cfg.OutputDir, filename)
 
-	type task struct {
-		filename string
-		query    string
-	}
-
-	// 构建 daily_basic_data 的 JOIN 查询：动态获取 exposure 列避免列名冲突
-	dailySQL, err := buildDailyBasicSQL(sqlDB, dateFilter)
+	// 构建合并查询：equity + exposure + mkt_idx 全部 JOIN 进同一张表
+	query, err := buildDailyBasicSQL(sqlDB, dateFilter)
 	if err != nil {
-		log.Printf("[daily_basic] 构建 daily_basic_data SQL 失败: %v，将仅写入 equity 数据", err)
-		dailySQL = buildEquitySQL(dateFilter)
+		log.Printf("[daily_basic] 构建SQL失败: %v，降级为仅 equity 数据", err)
+		query = buildEquitySQL(dateFilter)
 	}
 
-	tasks := []task{
-		{
-			filename: dateStr + "_equity_data.parquet",
-			query:    buildEquitySQL(dateFilter),
-		},
-		{
-			filename: dateStr + "_exposure_sw21.parquet",
-			query:    fmt.Sprintf("SELECT * FROM dy1d_exposure_sw21 WHERE TRADE_DATE = '%s'", dateFilter),
-		},
-		{
-			filename: dateStr + "_daily_basic_data.parquet",
-			query:    dailySQL,
-		},
-		{
-			filename: dateStr + "_mkt_idx.parquet",
-			query: fmt.Sprintf(`
-SELECT
-    TRADE_DATE      AS TS,
-    TICKER_SYMBOL   AS index_code,
-    CLOSE_INDEX     AS close,
-    CHG_PCT / 100.0 AS mkt_ret,
-    TURNOVER_VOL    AS volume
-FROM mkt_idxd_csi
-WHERE TRADE_DATE = '%s'`, dateFilter),
-		},
+	n, err := writeQueryToParquet(sqlDB, query, outputPath)
+	if err != nil {
+		return 0, fmt.Errorf("写入 %s 失败: %w", filename, err)
 	}
+	log.Printf("[daily_basic] %s 写入成功: %d 行", filename, n)
 
-	for _, t := range tasks {
-		outputPath := filepath.Join(cfg.OutputDir, t.filename)
-		n, err := writeQueryToParquet(sqlDB, t.query, outputPath)
-		if err != nil {
-			log.Printf("[daily_basic][%s] 写入失败: %v", t.filename, err)
-			continue
-		}
-		log.Printf("[daily_basic][%s] 写入成功: %d 行", t.filename, n)
-		generated++
-
-		if uploader != nil {
-			ossKey := uploader.BuildFilePath(cfg.TradingDay, t.filename)
-			if err := uploader.UploadLocalFile(outputPath, ossKey); err != nil {
-				log.Printf("[daily_basic][%s] OSS上传失败: %v", t.filename, err)
-			}
+	if uploader != nil {
+		ossKey := uploader.BuildFilePath(cfg.TradingDay, filename)
+		if err := uploader.UploadLocalFile(outputPath, ossKey); err != nil {
+			log.Printf("[daily_basic] OSS上传失败: %v", err)
 		}
 	}
 
-	return generated, nil
+	return 1, nil
 }
 
 // buildEquitySQL 构建股票行情+市值查询
@@ -155,12 +118,17 @@ WHERE t1.TRADE_DATE   = '%s'
 ORDER BY t1.TICKER_SYMBOL`, dateFilter)
 }
 
-// buildDailyBasicSQL 构建 equity LEFT JOIN exposure 的合并查询。
-// 先查询 exposure 表的列名，排除 key 列后拼接进 SELECT，避免列名重复。
+// buildDailyBasicSQL 构建一条合并 SQL：
+//   mkt_equd (行情) JOIN mkt_equd_adj_af (复权)
+//   LEFT JOIN dy1d_exposure_sw21 (SW21因子暴露)
+//   LEFT JOIN mkt_idxd_csi (市场指数，取 000300/000905 等主要指数的当日涨跌)
+//
+// 动态读取 exposure 表列名，排除 key 列，避免 SELECT * 产生列名冲突。
 func buildDailyBasicSQL(db *sql.DB, dateFilter string) (string, error) {
+	// --- 1. 动态获取 exposure 表的因子列 ---
 	rows, err := db.Query("SHOW COLUMNS FROM dy1d_exposure_sw21")
 	if err != nil {
-		return "", fmt.Errorf("SHOW COLUMNS 失败: %w", err)
+		return "", fmt.Errorf("SHOW COLUMNS dy1d_exposure_sw21 失败: %w", err)
 	}
 	defer rows.Close()
 
@@ -173,8 +141,7 @@ func buildDailyBasicSQL(db *sql.DB, dateFilter string) (string, error) {
 		if err := rows.Scan(&field, &colType, &null, &key, &defVal, &extra); err != nil {
 			continue
 		}
-		colName := strings.ToUpper(field.String)
-		if !skipCols[colName] {
+		if !skipCols[strings.ToUpper(field.String)] {
 			expCols = append(expCols, fmt.Sprintf("    e.%s", field.String))
 		}
 	}
@@ -182,6 +149,48 @@ func buildDailyBasicSQL(db *sql.DB, dateFilter string) (string, error) {
 	expSelect := ""
 	if len(expCols) > 0 {
 		expSelect = ",\n" + strings.Join(expCols, ",\n")
+	}
+
+	// --- 2. 动态获取 mkt_idxd_csi 表的指数列（排除 key 列）---
+	idxRows, err := db.Query("SHOW COLUMNS FROM mkt_idxd_csi")
+	if err != nil {
+		// 表不存在时降级，不包含指数列
+		idxRows = nil
+	}
+
+	skipIdxCols := map[string]bool{
+		"TRADE_DATE": true, "TICKER_SYMBOL": true, "SECURITY_ID": true,
+	}
+	var idxCols []string
+	if idxRows != nil {
+		defer idxRows.Close()
+		for idxRows.Next() {
+			var field, colType, null, key, defVal, extra sql.NullString
+			if err := idxRows.Scan(&field, &colType, &null, &key, &defVal, &extra); err != nil {
+				continue
+			}
+			if !skipIdxCols[strings.ToUpper(field.String)] {
+				idxCols = append(idxCols, fmt.Sprintf("    idx.%s AS idx_%s", field.String, field.String))
+			}
+		}
+	}
+
+	idxSelect := ""
+	if len(idxCols) > 0 {
+		idxSelect = ",\n" + strings.Join(idxCols, ",\n")
+	}
+
+	// mkt_idxd_csi 里沪深市场综合指数的代码（如 000300 = 沪深300）
+	// 用一个子查询聚合成一行，拼到每只股票上
+	idxJoin := ""
+	if idxSelect != "" {
+		idxJoin = fmt.Sprintf(`
+LEFT JOIN (
+    SELECT *
+    FROM mkt_idxd_csi
+    WHERE TRADE_DATE = '%s'
+      AND TICKER_SYMBOL = '000300'   -- 沪深300，可按需调整
+) idx ON 1=1`, dateFilter)
 	}
 
 	return fmt.Sprintf(`
@@ -204,17 +213,17 @@ SELECT
     t1.NEG_MARKET_VALUE  AS float_mkt_cap,
     t1.TURNOVER_RATE     AS turnover_rate,
     t1.PE                AS pe_ttm,
-    t1.PB                AS pb%s
+    t1.PB                AS pb%s%s
 FROM mkt_equd t1
 JOIN mkt_equd_adj_af t2
     ON  t1.SECURITY_ID = t2.SECURITY_ID
     AND t1.TRADE_DATE  = t2.TRADE_DATE
 LEFT JOIN dy1d_exposure_sw21 e
     ON  t1.TICKER_SYMBOL = e.TICKER_SYMBOL
-    AND t1.TRADE_DATE    = e.TRADE_DATE
+    AND t1.TRADE_DATE    = e.TRADE_DATE%s
 WHERE t1.TRADE_DATE   = '%s'
   AND t1.EXCHANGE_CD IN ('XSHG', 'XSHE')
-ORDER BY t1.TICKER_SYMBOL`, expSelect, dateFilter), nil
+ORDER BY t1.TICKER_SYMBOL`, expSelect, idxSelect, idxJoin, dateFilter), nil
 }
 
 // writeQueryToParquet 执行 SQL 查询并将结果写入 Parquet 文件。
