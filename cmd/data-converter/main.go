@@ -855,8 +855,8 @@ func runDailyBasicMonthMode() {
 		dateStr := date.Format("20060102")
 		log.Printf("\n[%d/%d] %s", i+1, len(dates), date.Format("2006-01-02"))
 
-		// 检查 OSS：四个文件都存在则跳过
-		if uploader != nil && !*flagDailyBasicSkipOSS {
+		// 检查 OSS：四个文件都存在则跳过（ForceRegen=true 时不跳过）
+		if uploader != nil && !*flagDailyBasicSkipOSS && !*flagDailyBasicForce {
 			if uploader.AllDayFilesExist(date) {
 				log.Printf("[跳过] OSS 中已存在四个 Parquet 文件")
 				skipDays++
