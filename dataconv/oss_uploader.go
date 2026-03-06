@@ -250,3 +250,19 @@ func (u *OSSUploader) UploadLocalFile(localPath, ossKey string) error {
 	log.Printf("[OSS] 上传成功: %s", ossKey)
 	return nil
 }
+
+// DeleteFile 删除 OSS 中的指定文件
+func (u *OSSUploader) DeleteFile(ossKey string) error {
+	if err := u.bucket.DeleteObject(ossKey); err != nil {
+		return fmt.Errorf("OSS删除失败 [%s]: %w", ossKey, err)
+	}
+	log.Printf("[OSS] 删除成功: %s", ossKey)
+	return nil
+}
+
+// DeleteDailyBasicFile 删除指定交易日的 daily_basic_data.parquet 文件
+func (u *OSSUploader) DeleteDailyBasicFile(tradingDay time.Time) error {
+	filename := tradingDay.Format("20060102") + "_daily_basic_data.parquet"
+	ossKey := u.BuildFilePath(tradingDay, filename)
+	return u.DeleteFile(ossKey)
+}

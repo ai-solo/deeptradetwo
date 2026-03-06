@@ -62,8 +62,9 @@ var (
 	flagFlushDaily = flag.Bool("flush-daily", true, "每天处理完立即写入Parquet")
 
 	// daily basic data 参数
-	flagDailyBasic      = flag.Bool("daily-basic", false, "生成每日基础数据 Parquet (equity/exposure/mkt_idx/daily_basic_data)")
+	flagDailyBasic        = flag.Bool("daily-basic", false, "生成每日基础数据 Parquet (equity/exposure/mkt_idx/daily_basic_data)")
 	flagDailyBasicSkipOSS = flag.Bool("daily-basic-skip-oss-check", false, "跳过 OSS 存在检查，强制重新生成 daily basic data")
+	flagDailyBasicForce   = flag.Bool("daily-basic-force", false, "强制删除并重新生成 daily_basic_data.parquet (添加 SECURITY_ID 字段)")
 )
 
 func main() {
@@ -193,6 +194,7 @@ func runBatchMode() {
 								TradingDay: date,
 								OutputDir:  *flagOutputDir,
 								OSSConfig:  ossConfig,
+								ForceRegen: *flagDailyBasicForce,
 							})
 							if genErr != nil {
 								log.Printf("[daily_basic] 生成失败: %v", genErr)
@@ -280,6 +282,7 @@ func processSingleDay(date time.Time, downloader *dataconv.Downloader) error {
 						TradingDay: date,
 						OutputDir:  *flagOutputDir,
 						OSSConfig:  ossConfig,
+						ForceRegen: *flagDailyBasicForce,
 					})
 					if err != nil {
 						log.Printf("[daily_basic] 生成失败: %v", err)
@@ -470,6 +473,7 @@ func processSingleDay(date time.Time, downloader *dataconv.Downloader) error {
 				TradingDay: date,
 				OutputDir:  *flagOutputDir,
 				OSSConfig:  getOSSConfig(),
+				ForceRegen: *flagDailyBasicForce,
 			})
 			if err != nil {
 				log.Printf("[daily_basic] 生成失败: %v", err)
@@ -871,6 +875,7 @@ func runDailyBasicMonthMode() {
 			TradingDay: date,
 			OutputDir:  *flagOutputDir,
 			OSSConfig:  ossConfig,
+			ForceRegen: *flagDailyBasicForce,
 		})
 		if err != nil {
 			log.Printf("[失败] %s: %v", dateStr, err)

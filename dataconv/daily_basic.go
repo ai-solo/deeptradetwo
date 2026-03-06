@@ -22,9 +22,10 @@ import (
 
 // DailyBasicConfig daily basic data 生成配置
 type DailyBasicConfig struct {
-	TradingDay time.Time
-	OutputDir  string
-	OSSConfig  *OSSConfig // nil 表示不上传
+	TradingDay    time.Time
+	OutputDir     string
+	OSSConfig     *OSSConfig // nil 表示不上传
+	ForceRegen    bool       // 是否强制重新生成（删除 OSS 中已存在的文件）
 }
 
 // GenerateDailyBasicData 为指定交易日生成一份 Parquet 文件并（可选）上传 OSS。
@@ -63,6 +64,17 @@ func GenerateDailyBasicData(cfg DailyBasicConfig) (int, error) {
 	filename   := dateStr + "_daily_basic_data.parquet"
 	outputPath := filepath.Join(cfg.OutputDir, filename)
 
+	// 强制重新生成：先删除 OSS 中已存在的文件
+	if cfg.ForceRegen && uploader != nil {
+		ossKey := uploader.BuildFilePath(cfg.TradingDay, filename)
+		if uploader.ObjectExists(ossKey) {
+			log.Printf("[daily_basic] ForceRegen=true，删除 OSS 中的已存在文件: %s", ossKey)
+			if err := uploader.DeleteFile(ossKey); err != nil {
+				log.Printf("[daily_basic] 删除 OSS 文件失败: %v", err)
+			}
+		}
+	}
+
 	// 构建合并查询：equity + exposure + mkt_idx 全部 JOIN 进同一张表
 	query, err := buildDailyBasicSQL(sqlDB, dateFilter)
 	if err != nil {
@@ -92,6 +104,7 @@ func buildEquitySQL(dateFilter string) string {
 SELECT
     t1.TRADE_DATE        AS TS,
     t1.TICKER_SYMBOL     AS ID_QI,
+    t1.SECURITY_ID       AS SECURITY_ID,
     t2.OPEN_PRICE_2      AS open,
     t2.HIGHEST_PRICE     AS high,
     t2.LOWEST_PRICE      AS low,
@@ -197,6 +210,7 @@ LEFT JOIN (
 SELECT
     t1.TRADE_DATE        AS TS,
     t1.TICKER_SYMBOL     AS ID_QI,
+    t1.SECURITY_ID       AS SECURITY_ID,
     t2.OPEN_PRICE_2      AS open,
     t2.HIGHEST_PRICE     AS high,
     t2.LOWEST_PRICE      AS low,
