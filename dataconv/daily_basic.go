@@ -241,7 +241,10 @@ ORDER BY t1.TICKER_SYMBOL`, expSelect, idxSelect, idxJoin, dateFilter), nil
 }
 
 // writeQueryToParquet 执行 SQL 查询并将结果写入 Parquet 文件。
-// 列类型由 MySQL 返回的元数据动态推断：字符/日期类型 → String，其余 → Float64。
+// 列类型由 MySQL 返回的元数据动态推断：
+//   - 字符/日期类型 → String
+//   - 整型 → Int64
+//   - 其他数值 → Float64
 // 重复列名会自动追加 _2 / _3 … 后缀。
 // 返回写入的行数。
 func writeQueryToParquet(db *sql.DB, query, outputPath string) (int, error) {
@@ -256,9 +259,16 @@ func writeQueryToParquet(db *sql.DB, query, outputPath string) (int, error) {
 		return 0, fmt.Errorf("获取列类型失败: %w", err)
 	}
 
+	// 列类型枚举
+	const (
+		colTypeString = iota
+		colTypeInt64
+		colTypeFloat64
+	)
+
 	// 推断 Arrow 列类型，并处理重复列名
-	fields   := make([]arrow.Field, len(colTypes))
-	isString := make([]bool, len(colTypes))
+	fields    := make([]arrow.Field, len(colTypes))
+	colTypes_ := make([]int, len(colTypes))
 	seenNames := make(map[string]int, len(colTypes))
 
 	for i, ct := range colTypes {
@@ -273,10 +283,14 @@ func writeQueryToParquet(db *sql.DB, query, outputPath string) (int, error) {
 		switch ct.DatabaseTypeName() {
 		case "VARCHAR", "CHAR", "TEXT", "LONGTEXT", "MEDIUMTEXT",
 			"DATE", "DATETIME", "TIMESTAMP", "TIME", "YEAR":
-			fields[i]   = arrow.Field{Name: name, Type: arrow.BinaryTypes.String, Nullable: true}
-			isString[i] = true
+			fields[i]    = arrow.Field{Name: name, Type: arrow.BinaryTypes.String, Nullable: true}
+			colTypes_[i] = colTypeString
+		case "BIGINT", "INT", "INTEGER", "SMALLINT", "TINYINT", "MEDIUMINT":
+			fields[i]    = arrow.Field{Name: name, Type: arrow.PrimitiveTypes.Int64, Nullable: true}
+			colTypes_[i] = colTypeInt64
 		default:
-			fields[i] = arrow.Field{Name: name, Type: arrow.PrimitiveTypes.Float64, Nullable: true}
+			fields[i]    = arrow.Field{Name: name, Type: arrow.PrimitiveTypes.Float64, Nullable: true}
+			colTypes_[i] = colTypeFloat64
 		}
 	}
 
@@ -296,14 +310,23 @@ func writeQueryToParquet(db *sql.DB, query, outputPath string) (int, error) {
 			return rowCount, fmt.Errorf("扫描行失败 (row %d): %w", rowCount, err)
 		}
 		for i, v := range vals {
-			if isString[i] {
+			switch colTypes_[i] {
+			case colTypeString:
 				b := builder.Field(i).(*array.StringBuilder)
 				if v == nil {
 					b.AppendNull()
 				} else {
-					b.Append(fmt.Sprintf("%v", v))
+					// MySQL 驱动返回 VARCHAR 时可能是 []byte，需要正确转换
+					b.Append(stringVal(v))
 				}
-			} else {
+			case colTypeInt64:
+				b := builder.Field(i).(*array.Int64Builder)
+				if v == nil {
+					b.AppendNull()
+				} else {
+					appendInt64(b, v)
+				}
+			default: // colTypeFloat64
 				b := builder.Field(i).(*array.Float64Builder)
 				if v == nil {
 					b.AppendNull()
@@ -342,6 +365,48 @@ func writeQueryToParquet(db *sql.DB, query, outputPath string) (int, error) {
 	writer.Close()
 
 	return rowCount, nil
+}
+
+// stringVal 将 SQL 扫描到的值转换为字符串，正确处理 []byte 类型
+func stringVal(v interface{}) string {
+	switch tv := v.(type) {
+	case string:
+		return tv
+	case []byte:
+		return string(tv)
+	default:
+		return fmt.Sprintf("%v", tv)
+	}
+}
+
+// appendInt64 将 SQL 扫描到的任意整型追加到 Int64Builder
+func appendInt64(b *array.Int64Builder, v interface{}) {
+	switch tv := v.(type) {
+	case int64:
+		b.Append(tv)
+	case int32:
+		b.Append(int64(tv))
+	case int:
+		b.Append(int64(tv))
+	case uint64:
+		b.Append(int64(tv))
+	case uint32:
+		b.Append(int64(tv))
+	case []byte:
+		if i, err := strconv.ParseInt(string(tv), 10, 64); err == nil {
+			b.Append(i)
+		} else {
+			b.AppendNull()
+		}
+	case string:
+		if i, err := strconv.ParseInt(tv, 10, 64); err == nil {
+			b.Append(i)
+		} else {
+			b.AppendNull()
+		}
+	default:
+		b.AppendNull()
+	}
 }
 
 // appendFloat64 将 SQL 扫描到的任意数值类型追加到 Float64Builder
