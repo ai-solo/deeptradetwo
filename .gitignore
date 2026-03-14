@@ -31,3 +31,8 @@ cmd/data-converter/data-converter
 
 # 临时文件
 .tmp_*
+
+# 含密钥的配置文件
+deploy/pipeline/pipeline.toml
+deploy/pipeline/userdata-2025-01.sh
+deploy/pipeline/test-run.sh
