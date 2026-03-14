@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -49,26 +50,38 @@ func (p *Processor) ResortFromOSS(tradingDay time.Time, tmpDir string) error {
 		return fmt.Errorf("读取 tick 失败: %w", err)
 	}
 
-	// 3. 排序
+	// 3. 并发排序
 	log.Printf("[重排序] 排序 %d orders, %d deals, %d ticks...", len(orders), len(deals), len(ticks))
-	sort.Slice(orders, func(i, j int) bool {
-		if orders[i].Code != orders[j].Code {
-			return orders[i].Code < orders[j].Code
-		}
-		return orders[i].SeqNum < orders[j].SeqNum
-	})
-	sort.Slice(deals, func(i, j int) bool {
-		if deals[i].Code != deals[j].Code {
-			return deals[i].Code < deals[j].Code
-		}
-		return deals[i].SeqNum < deals[j].SeqNum
-	})
-	sort.Slice(ticks, func(i, j int) bool {
-		if ticks[i].Code != ticks[j].Code {
-			return ticks[i].Code < ticks[j].Code
-		}
-		return ticks[i].SeqNum < ticks[j].SeqNum
-	})
+	var sortWg sync.WaitGroup
+	sortWg.Add(3)
+	go func() {
+		defer sortWg.Done()
+		sort.Slice(orders, func(i, j int) bool {
+			if orders[i].Code != orders[j].Code {
+				return orders[i].Code < orders[j].Code
+			}
+			return orders[i].SeqNum < orders[j].SeqNum
+		})
+	}()
+	go func() {
+		defer sortWg.Done()
+		sort.Slice(deals, func(i, j int) bool {
+			if deals[i].Code != deals[j].Code {
+				return deals[i].Code < deals[j].Code
+			}
+			return deals[i].SeqNum < deals[j].SeqNum
+		})
+	}()
+	go func() {
+		defer sortWg.Done()
+		sort.Slice(ticks, func(i, j int) bool {
+			if ticks[i].Code != ticks[j].Code {
+				return ticks[i].Code < ticks[j].Code
+			}
+			return ticks[i].SeqNum < ticks[j].SeqNum
+		})
+	}()
+	sortWg.Wait()
 
 	// 4. 写出到本地（写入 outputDir），临时禁用 OSS 避免重复上传
 	log.Printf("[重排序] 写出排序后文件...")
