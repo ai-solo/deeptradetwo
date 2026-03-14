@@ -163,6 +163,17 @@ func (r *ZipReader) readZipExtract(zipPath string, isEncrypted bool, chunkSize i
 	}, nil
 }
 
+// ReadAll 读取ZIP文件全部数据，返回 header 和 rows（适合全内存处理）
+func (r *ZipReader) ReadAll(zipPath string, opts ...ReadOptions) (header []string, rows [][]string, err error) {
+	iter, err := r.ReadZipFile(zipPath, opts...)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer iter.Close()
+	header, rows, err = iter.ReadAllFast()
+	return
+}
+
 // isEncrypted 检查ZIP是否加密
 func (r *ZipReader) isEncrypted(zipPath string) (bool, error) {
 	reader, err := zip.OpenReader(zipPath)
@@ -325,7 +336,7 @@ func (it *CSVIterator) ReadChunk() ([][]string, error) {
 	return records, nil
 }
 
-// ReadAll 读取所有数据
+// ReadAll 读取所有数据（header 包含在第一行）
 func (it *CSVIterator) ReadAll() ([][]string, error) {
 	header, err := it.Header()
 	if err != nil {
@@ -347,6 +358,26 @@ func (it *CSVIterator) ReadAll() ([][]string, error) {
 	}
 
 	return allRecords, nil
+}
+
+// ReadAllFast 读取所有数据，返回 header 和 rows 分开（零拷贝，适合全内存处理）
+func (it *CSVIterator) ReadAllFast() (header []string, rows [][]string, err error) {
+	header, err = it.Header()
+	if err != nil {
+		return
+	}
+	for {
+		chunk, e := it.ReadChunk()
+		if e != nil {
+			err = e
+			return
+		}
+		if len(chunk) == 0 {
+			break
+		}
+		rows = append(rows, chunk...)
+	}
+	return
 }
 
 // Close 关闭迭代器并清理临时文件

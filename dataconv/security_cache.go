@@ -136,6 +136,7 @@ func (sc *SecurityCache) GetIDWithDate(code string, tradingDay time.Time) (int32
 }
 
 // queryDB 向数据库查询单个 code 的 SECURITY_ID，不操作缓存
+// 当 XSHG/XSHE 查不到时，回退到 OFCN（场外基金在行情数据中用交易所代码，但数据库登记为OFCN）
 func (sc *SecurityCache) queryDB(code string) (int32, error) {
 	tickerSymbol, exchangeCD, err := parseCode(code)
 	if err != nil {
@@ -143,10 +144,15 @@ func (sc *SecurityCache) queryDB(code string) (int32, error) {
 	}
 	var id int32
 	query := "SELECT SECURITY_ID FROM md_security WHERE TICKER_SYMBOL = ? AND EXCHANGE_CD = ?"
-	if err := sc.db.QueryRow(query, tickerSymbol, exchangeCD).Scan(&id); err != nil {
-		return 0, err
+	if err := sc.db.QueryRow(query, tickerSymbol, exchangeCD).Scan(&id); err == nil {
+		return id, nil
 	}
-	return id, nil
+	if exchangeCD == "XSHG" || exchangeCD == "XSHE" {
+		if err2 := sc.db.QueryRow(query, tickerSymbol, "OFCN").Scan(&id); err2 == nil {
+			return id, nil
+		}
+	}
+	return 0, fmt.Errorf("证券代码不存在: %s", code)
 }
 
 // BatchLoad 批量加载 Code 到缓存，tradingDay 用于旧代码回退判断（零值表示不限制）
@@ -240,6 +246,53 @@ func (sc *SecurityCache) BatchLoad(codes []string, tradingDay time.Time) error {
 			if origCode != qCode {
 				sc.codeToID[origCode] = securityID
 				found[origCode] = true
+			}
+		}
+	}
+
+	// 未找到的 XSHG/XSHE 代码，尝试 OFCN 回退（场外基金在行情数据中用交易所代码，但数据库登记为OFCN）
+	ofcnValues := make([]interface{}, 0)
+	ofcnPlaceholders := make([]string, 0)
+	ofcnQCodeToOriginals := make(map[string][]string)
+	for qCode, originals := range queryCodeToOriginals {
+		if !found[qCode] {
+			p := queryParsed[qCode]
+			if p.exchange == "XSHG" || p.exchange == "XSHE" {
+				ofcnCode := fmt.Sprintf("%s.OFCN", p.ticker)
+				ofcnValues = append(ofcnValues, p.ticker, "OFCN")
+				ofcnPlaceholders = append(ofcnPlaceholders, "(?, ?)")
+				ofcnQCodeToOriginals[ofcnCode] = append(ofcnQCodeToOriginals[ofcnCode], originals...)
+				ofcnQCodeToOriginals[ofcnCode] = append(ofcnQCodeToOriginals[ofcnCode], qCode)
+				found[qCode] = true // 先标记，避免下面写负缓存
+			}
+		}
+	}
+	if len(ofcnPlaceholders) > 0 {
+		ofcnQuery := fmt.Sprintf(
+			"SELECT TICKER_SYMBOL, EXCHANGE_CD, SECURITY_ID FROM md_security WHERE (TICKER_SYMBOL, EXCHANGE_CD) IN (%s)",
+			strings.Join(ofcnPlaceholders, ", "),
+		)
+		ofcnRows, err2 := sc.db.Query(ofcnQuery, ofcnValues...)
+		if err2 == nil {
+			for ofcnRows.Next() {
+				var ticker, exchange string
+				var securityID int32
+				if err3 := ofcnRows.Scan(&ticker, &exchange, &securityID); err3 != nil {
+					continue
+				}
+				ofcnCode := fmt.Sprintf("%s.%s", ticker, exchange)
+				sc.codeToID[ofcnCode] = securityID
+				for _, origCode := range ofcnQCodeToOriginals[ofcnCode] {
+					sc.codeToID[origCode] = securityID
+				}
+				delete(ofcnQCodeToOriginals, ofcnCode)
+			}
+			ofcnRows.Close()
+		}
+		// 仍未找到的写负缓存
+		for _, originals := range ofcnQCodeToOriginals {
+			for _, origCode := range originals {
+				sc.codeToID[origCode] = SecurityNotFound
 			}
 		}
 	}

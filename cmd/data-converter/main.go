@@ -41,6 +41,9 @@ var (
 	flagOSSBasePath  = flag.String("oss-path", "", "OSS 存储路径前缀 (默认: market_data)")
 	flagOSSCleanLocal = flag.Bool("oss-clean-local", false, "OSS上传后删除本地Parquet文件")
 	
+	// 重排序参数
+	flagResort = flag.Bool("resort", false, "OSS已有文件时，下载→按Code+SeqNum重排序→重新上传（替代直接跳过）")
+
 	// 自动下载参数
 	flagAutoDownload     = flag.Bool("auto-download", false, "启用自动下载模式")
 	flagAria2URL         = flag.String("aria2-url", "http://121.43.209.82:6800/jsonrpc", "Aria2 JSON-RPC地址")
@@ -553,6 +556,33 @@ func runSingleDayMode() {
 		log.Fatalf("创建处理器失败: %v", err)
 	}
 
+	// OSS 前置检查：三个文件都存在时走重排序路径
+	if *flagOSS && *flagOptimize {
+		ossConfig := getOSSConfig()
+		if ossConfig != nil {
+			uploader, uperr := dataconv.NewOSSUploader(*ossConfig)
+			if uperr == nil && uploader.TradeDataFilesExist(tradingDay) {
+				if *flagResort {
+					log.Println("========================================")
+					log.Printf("[OSS] %s 三个文件已存在，执行重排序...", tradingDay.Format("20060102"))
+					log.Println("========================================")
+					tmpDir := filepath.Join(outputDir, ".resort_tmp")
+					if err := os.MkdirAll(tmpDir, 0755); err != nil {
+						log.Fatalf("创建临时目录失败: %v", err)
+					}
+					defer os.RemoveAll(tmpDir)
+					if err := processor.ResortFromOSS(tradingDay, tmpDir); err != nil {
+						log.Fatalf("重排序失败: %v", err)
+					}
+					log.Printf("[完成] 重排序完成")
+				} else {
+					log.Printf("[跳过] %s OSS已有三个数据文件，跳过处理（用 -resort 强制重排序）", tradingDay.Format("20060102"))
+				}
+				return
+			}
+		}
+	}
+
 	// 根据日期确定数据文件
 	datePath := tradingDay.Format("2006/2006.01/20060102")
 	datePrefix := tradingDay.Format("20060102")
@@ -563,7 +593,70 @@ func runSingleDayMode() {
 	market := strings.ToLower(*flagMarket)
 	dataType := strings.ToLower(*flagDataType)
 
-	// 上交所数据
+	// 构建文件映射，走全量内存处理路径（-optimize 模式）
+	if *flagOptimize {
+		zipFiles := map[string][]string{}
+
+		if market == "all" || market == "sh" {
+			if dataType == "all" || dataType == "order" || dataType == "deal" {
+				if tradingDay.After(time.Date(2023, 12, 21, 0, 0, 0, 0, time.Local)) {
+					if p := findDataFile(dataDir, datePath, datePrefix+"_mdl_4_24_0.csv.zip"); p != "" {
+						zipFiles["sh_orderdeal"] = append(zipFiles["sh_orderdeal"], p)
+					} else {
+						log.Printf("[警告] 找不到上交所委托+成交文件")
+					}
+				} else {
+					if p := findDataFile(dataDir, datePath, datePrefix+"_mdl_4_19_0.csv.zip"); p != "" {
+						zipFiles["sh_orderdeal"] = append(zipFiles["sh_orderdeal"], p)
+					}
+				}
+			}
+			if dataType == "all" || dataType == "tick" {
+				if p := findDataFile(dataDir, datePath, datePrefix+"_MarketData.csv.zip"); p != "" {
+					zipFiles["sh_tick"] = append(zipFiles["sh_tick"], p)
+				} else {
+					log.Printf("[警告] 找不到上交所快照文件")
+				}
+			}
+		}
+
+		if market == "all" || market == "sz" {
+			if dataType == "all" || dataType == "order" {
+				if p := findDataFile(dataDir, datePath, datePrefix+"_mdl_6_33_0.csv.zip"); p != "" {
+					zipFiles["sz_order"] = append(zipFiles["sz_order"], p)
+				} else {
+					log.Printf("[警告] 找不到深交所委托文件")
+				}
+			}
+			if dataType == "all" || dataType == "deal" {
+				if p := findDataFile(dataDir, datePath, datePrefix+"_mdl_6_36_0.csv.zip"); p != "" {
+					zipFiles["sz_deal"] = append(zipFiles["sz_deal"], p)
+				} else {
+					log.Printf("[警告] 找不到深交所成交文件")
+				}
+			}
+			if dataType == "all" || dataType == "tick" {
+				for _, suffix := range []string{"_mdl_6_28_0.csv.zip", "_mdl_6_28_1.csv.zip", "_mdl_6_28_2.csv.zip"} {
+					if p := findDataFile(dataDir, datePath, datePrefix+suffix); p != "" {
+						zipFiles["sz_tick"] = append(zipFiles["sz_tick"], p)
+					}
+				}
+				if len(zipFiles["sz_tick"]) == 0 {
+					log.Printf("[警告] 找不到深交所快照文件")
+				}
+			}
+		}
+
+		if err := processor.ProcessAllInMemory(zipFiles); err != nil {
+			log.Fatalf("全量内存处理失败: %v", err)
+		}
+
+		log.Println("========================================")
+		log.Printf("[完成] 总耗时: %v", time.Since(totalStart))
+		return
+	}
+
+	// 非 optimize 模式：原有逐文件处理路径
 	if market == "all" || market == "sh" {
 		// 2023-12-22 之后使用 mdl_4_24_0 (委托+成交合并)
 		if tradingDay.After(time.Date(2023, 12, 21, 0, 0, 0, 0, time.Local)) {
@@ -578,7 +671,6 @@ func runSingleDayMode() {
 				}
 			}
 		} else {
-			// 旧格式
 			if dataType == "all" || dataType == "order" {
 				orderPath := findDataFile(dataDir, datePath, datePrefix+"_mdl_4_19_0.csv.zip")
 				if orderPath != "" {
@@ -590,7 +682,6 @@ func runSingleDayMode() {
 			if dataType == "all" || dataType == "deal" {
 				dealPath := findDataFile(dataDir, datePath, datePrefix+"_Transaction.csv.zip")
 				if dealPath != "" {
-					// 需要单独的成交处理函数
 					log.Printf("[提示] 上交所成交文件: %s (需要单独处理)", dealPath)
 				}
 			}
@@ -608,7 +699,6 @@ func runSingleDayMode() {
 		}
 	}
 
-	// 深交所数据
 	if market == "all" || market == "sz" {
 		if dataType == "all" || dataType == "order" {
 			orderPath := findDataFile(dataDir, datePath, datePrefix+"_mdl_6_33_0.csv.zip")

@@ -260,6 +260,49 @@ func (u *OSSUploader) DeleteFile(ossKey string) error {
 	return nil
 }
 
+// DownloadFile 从 OSS 下载文件到本地路径
+func (u *OSSUploader) DownloadFile(ossKey, localPath string) error {
+	if err := os.MkdirAll(filepath.Dir(localPath), 0755); err != nil {
+		return fmt.Errorf("创建目录失败: %w", err)
+	}
+	if err := u.bucket.GetObjectToFile(ossKey, localPath); err != nil {
+		return fmt.Errorf("OSS下载失败 [%s -> %s]: %w", ossKey, localPath, err)
+	}
+	log.Printf("[OSS] 下载成功: %s -> %s", ossKey, localPath)
+	return nil
+}
+
+// DownloadTradeDataFiles 下载某交易日的 order/deal/tick 三个 Parquet 到指定目录
+func (u *OSSUploader) DownloadTradeDataFiles(tradingDay time.Time, localDir string) (orderPath, dealPath, tickPath string, err error) {
+	dateStr := tradingDay.Format("20060102")
+	files := map[string]*string{
+		dateStr + "_order.parquet": &orderPath,
+		dateStr + "_deal.parquet":  &dealPath,
+		dateStr + "_tick.parquet":  &tickPath,
+	}
+	for name, dst := range files {
+		ossKey := u.BuildFilePath(tradingDay, name)
+		localPath := filepath.Join(localDir, name)
+		if e := u.DownloadFile(ossKey, localPath); e != nil {
+			err = e
+			return
+		}
+		*dst = localPath
+	}
+	return
+}
+
+// DeleteTradeDataFiles 删除 OSS 上某交易日的 order/deal/tick 三个文件
+func (u *OSSUploader) DeleteTradeDataFiles(tradingDay time.Time) error {
+	for _, name := range DailyParquetFileNames(tradingDay, false) {
+		ossKey := u.BuildFilePath(tradingDay, name)
+		if err := u.DeleteFile(ossKey); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // DeleteDailyBasicFile 删除指定交易日的 daily_basic_data.parquet 文件
 func (u *OSSUploader) DeleteDailyBasicFile(tradingDay time.Time) error {
 	filename := tradingDay.Format("20060102") + "_daily_basic_data.parquet"
