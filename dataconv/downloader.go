@@ -114,14 +114,14 @@ func (d *Downloader) FilterAndSortFiles(files []fileserver.FileInfo, date time.T
 		// 深交所数据
 		if market == "all" || market == "sz" {
 			if (dataType == "all" || dataType == "order") &&
-				strings.HasSuffix(name, "_mdl_6_33_0.csv.zip") {
+				strings.Contains(name, "_mdl_6_33_") && strings.HasSuffix(name, ".csv.zip") {
 				task.Priority = 20
 				tasks = append(tasks, task)
 				continue
 			}
 
 			if (dataType == "all" || dataType == "deal") &&
-				strings.HasSuffix(name, "_mdl_6_36_0.csv.zip") {
+				strings.Contains(name, "_mdl_6_36_") && strings.HasSuffix(name, ".csv.zip") {
 				task.Priority = 30
 				tasks = append(tasks, task)
 				continue

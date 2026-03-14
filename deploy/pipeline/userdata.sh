@@ -38,6 +38,10 @@ ECS_REGION="{{ECS_REGION}}"
 # 从阿里云元数据服务获取实例 ID
 ECS_INSTANCE_ID=$(curl -sf http://100.100.100.200/latest/meta-data/instance-id || echo "")
 
+# cloud-init 环境下 HOME 可能未定义
+export HOME=${HOME:-/root}
+export GOCACHE=${GOCACHE:-/root/.cache/go-build}
+
 LOG=/var/log/data-pipeline.log
 exec > >(tee -a $LOG) 2>&1
 
@@ -87,14 +91,11 @@ echo ""
 # ================================================================
 log_step "1/7 安装系统依赖"
 # ================================================================
-log_info "apt-get update"
+log_info "apt 安装基础依赖"
+export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-log_info "安装 git curl wget unzip aria2 ..."
-apt-get install -y --no-install-recommends \
-    git curl wget unzip aria2 \
-    ca-certificates tzdata sysstat
-ln -snf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
-echo Asia/Shanghai > /etc/timezone
+apt-get install -y -qq git curl wget unzip ca-certificates sysstat aria2
+timedatectl set-timezone Asia/Shanghai 2>/dev/null || ln -snf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
 log_ok "依赖安装完成"
 log_sys
 log_elapsed
@@ -102,19 +103,20 @@ log_elapsed
 # ================================================================
 log_step "2/7 安装 Go"
 # ================================================================
-GO_VERSION="1.24.0"
 if command -v go &>/dev/null; then
     log_info "Go 已存在: $(go version)"
 else
-    log_info "下载 Go ${GO_VERSION} (依次尝试: 中科大/阿里云/golang.google.cn)"
-    # 依次尝试多个镜像源
-    wget -q --timeout=60 "https://mirrors.ustc.edu.cn/golang/go${GO_VERSION}.linux-amd64.tar.gz" -O /tmp/go.tar.gz \
-        || wget -q --timeout=60 "https://mirrors.aliyun.com/golang/go${GO_VERSION}.linux-amd64.tar.gz" -O /tmp/go.tar.gz \
-        || wget -q --timeout=120 "https://golang.google.cn/dl/go${GO_VERSION}.linux-amd64.tar.gz" -O /tmp/go.tar.gz
+    log_info "下载并安装 Go"
+    GO_VER="1.23.5"
+    GOARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+    GO_TAR="go${GO_VER}.linux-${GOARCH}.tar.gz"
+    log_info "下载 ${GO_TAR}"
+    wget -nv --timeout=60 -O /tmp/${GO_TAR} \
+        "https://mirrors.aliyun.com/golang/${GO_TAR}" 2>&1
     log_info "解压 Go"
-    tar -C /usr/local -xzf /tmp/go.tar.gz
-    rm /tmp/go.tar.gz
-    ln -sf /usr/local/go/bin/go /usr/local/bin/go
+    tar -C /usr/local -xzf /tmp/${GO_TAR}
+    rm -f /tmp/${GO_TAR}
+    log_ok "Go 解压完成"
 fi
 export GOPATH=/root/go
 export PATH=$PATH:/usr/local/go/bin:$GOPATH/bin
@@ -127,24 +129,29 @@ log_step "3/7 启动 aria2"
 # ================================================================
 mkdir -p /data/raw /data/parquet
 log_info "启动 aria2c (RPC 端口 6800)"
-aria2c \
-    --enable-rpc \
-    --rpc-listen-all=true \
-    --rpc-listen-port=6800 \
-    --rpc-secret="${ARIA2_TOKEN}" \
-    --dir=/data/raw \
-    --max-concurrent-downloads=10 \
-    --split=4 \
-    --max-connection-per-server=4 \
-    --continue=true \
-    --daemon=true \
-    --log=/var/log/aria2.log \
+ARIA2_ARGS=(
+    --enable-rpc
+    --rpc-allow-origin-all
+    --rpc-listen-all
+    --rpc-listen-port=6800
+    --user-agent="pan.baidu.com"
+    --max-concurrent-downloads=10
+    --split=32
+    --min-split-size=10M
+    --max-connection-per-server=4
+    --continue=true
+    --dir=/data/raw
+    --log=/var/log/aria2.log
     --log-level=notice
+    -D
+)
+[ -n "${ARIA2_TOKEN}" ] && ARIA2_ARGS+=(--rpc-secret="${ARIA2_TOKEN}")
+aria2c "${ARIA2_ARGS[@]}"
 sleep 2
 # 验证 aria2 是否正常响应
 if curl -sf -X POST http://127.0.0.1:6800/jsonrpc \
     -H 'Content-Type: application/json' \
-    -d "{\"jsonrpc\":\"2.0\",\"id\":\"ping\",\"method\":\"aria2.getVersion\",\"params\":[\"token:${ARIA2_TOKEN}\"]}" \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":\"ping\",\"method\":\"aria2.getVersion\",\"params\":[$([ -n \"${ARIA2_TOKEN}\" ] && echo \"\\\"token:${ARIA2_TOKEN}\\\"\" || echo)]}" \
     > /dev/null; then
     log_ok "aria2 RPC 响应正常"
 else
@@ -161,6 +168,8 @@ log_info "克隆仓库: ${GIT_REPO} (分支: ${GIT_BRANCH})"
 git clone --depth=1 --branch "${GIT_BRANCH}" "${GIT_REPO}" /src/deeptrade 2>&1
 log_ok "克隆完成"
 cd /src/deeptrade
+export HOME=/root
+export GOCACHE=/root/.cache/go-build
 log_info "编译 data-converter (CGO_ENABLED=0)"
 CGO_ENABLED=0 go build -v -ldflags='-s -w' -o /usr/local/bin/data-converter ./cmd/data-converter 2>&1
 log_ok "编译完成: $(/usr/local/bin/data-converter --help 2>&1 | head -1 || echo 'binary ok')"
@@ -345,8 +354,9 @@ log_step "7/7 自动释放 ECS"
 log_info "实例 ID: ${ECS_INSTANCE_ID}"
 if ! command -v aliyun &>/dev/null; then
     log_info "安装 aliyun cli"
-    wget -q https://aliyuncli.alicdn.com/aliyun-cli-linux-latest-amd64.tgz -O /tmp/aliyun-cli.tgz
-    tar -C /usr/local/bin -xzf /tmp/aliyun-cli.tgz aliyun
+    wget -q https://aliyuncli.alicdn.com/aliyun-cli-linux-latest-amd64.tgz -O /tmp/aliyun-cli.tgz \
+        && tar -C /usr/local/bin -xzf /tmp/aliyun-cli.tgz aliyun \
+        && rm -f /tmp/aliyun-cli.tgz
     log_ok "aliyun cli 安装完成: $(aliyun version)"
 fi
 

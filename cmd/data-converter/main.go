@@ -299,9 +299,9 @@ func runMonthMode() {
 				zipFiles["sh_orderdeal"] = append(zipFiles["sh_orderdeal"], job.task.LocalPath)
 			case strings.HasSuffix(name, "_MarketData.csv.zip"):
 				zipFiles["sh_tick"] = append(zipFiles["sh_tick"], job.task.LocalPath)
-			case strings.HasSuffix(name, "_mdl_6_33_0.csv.zip"):
+			case strings.Contains(name, "_mdl_6_33_") && strings.HasSuffix(name, ".csv.zip"):
 				zipFiles["sz_order"] = append(zipFiles["sz_order"], job.task.LocalPath)
-			case strings.HasSuffix(name, "_mdl_6_36_0.csv.zip"):
+			case strings.Contains(name, "_mdl_6_36_") && strings.HasSuffix(name, ".csv.zip"):
 				zipFiles["sz_deal"] = append(zipFiles["sz_deal"], job.task.LocalPath)
 			case strings.HasSuffix(name, "_mdl_6_28_0.csv.zip"):
 				zipFiles["sz_tick"] = append(zipFiles["sz_tick"], job.task.LocalPath)

@@ -47,6 +47,8 @@ type ECSConf struct {
 	// 抢占式实例
 	SpotStrategy        string  `toml:"spot_strategy"`   // SpotAsPriceGo | SpotWithPriceLimit | NoSpot
 	SpotPriceLimit      float32 `toml:"spot_price_limit"` // 出价上限(元/小时)，SpotWithPriceLimit 时有效
+	// 公网带宽
+	InternetMaxBandwidthOut int    `toml:"internet_max_bandwidth_out"` // 0=不分配公网IP，>0 分配公网IP
 }
 
 type GitConf struct {
@@ -243,6 +245,12 @@ func createECS(client *ecs.Client, cfg Config, month int) (string, error) {
 		if cfg.ECS.SpotStrategy == "SpotWithPriceLimit" && cfg.ECS.SpotPriceLimit > 0 {
 			req.SpotPriceLimit = tea.Float32(cfg.ECS.SpotPriceLimit)
 		}
+	}
+
+	// 公网带宽
+	if cfg.ECS.InternetMaxBandwidthOut > 0 {
+		req.InternetChargeType = tea.String("PayByTraffic")
+		req.InternetMaxBandwidthOut = tea.Int32(int32(cfg.ECS.InternetMaxBandwidthOut))
 	}
 
 	log.Printf("[%d-%02d] 创建 ECS: %s (规格: %s, 抢占策略: %s)", cfg.Year, month, instanceName, cfg.ECS.InstanceType, cfg.ECS.SpotStrategy)
