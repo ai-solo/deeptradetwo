@@ -46,9 +46,9 @@ var (
 
 	// 自动下载参数
 	flagAutoDownload     = flag.Bool("auto-download", false, "启用自动下载模式")
-	flagAria2URL         = flag.String("aria2-url", "http://121.43.209.82:6800/jsonrpc", "Aria2 JSON-RPC地址")
+	flagAria2URL         = flag.String("aria2-url", "", "Aria2 JSON-RPC地址")
 	flagAria2Token       = flag.String("aria2-token", "", "Aria2 认证token")
-	flagFileServerURL      = flag.String("fileserver-url", "http://121.43.209.82:5244", "文件服务器地址")
+	flagFileServerURL      = flag.String("fileserver-url", "", "文件服务器地址")
 	flagFileServerAuth     = flag.String("fileserver-auth", "", "文件服务器Authorization token (可选，过期时自动重新登录)")
 	flagFileServerUser     = flag.String("fileserver-username", "admin", "文件服务器登录用户名 (用于token过期时自动重新登录)")
 	flagFileServerPassHash = flag.String("fileserver-password", "", "文件服务器登录密码SHA256哈希值 (用于token过期时自动重新登录)")
@@ -87,6 +87,9 @@ func main() {
 
 	// 判断运行模式
 	switch {
+	case *flagAutoDownload && *flagYear > 0 && *flagMonth > 0:
+		// 自动下载 + 整月流水线处理
+		runMonthMode()
 	case *flagAutoDownload && (*flagYear > 0 || *flagStartDate != ""):
 		// 自动下载 + 批量处理（原有逻辑）
 		runBatchMode()
@@ -96,6 +99,274 @@ func main() {
 	default:
 		runSingleDayMode()
 	}
+}
+
+// runMonthMode 整月流水线模式：一次提交整月所有文件到 aria2，逐天串行处理
+// 下载和处理并行：处理第N天时，第N+1天的文件已在后台下载
+func runMonthMode() {
+	log.Printf("[模式] 整月流水线处理 %d-%02d", *flagYear, *flagMonth)
+
+	// 生成本月所有日期
+	dates, err := generateDateRange()
+	if err != nil {
+		log.Fatalf("生成日期范围失败: %v", err)
+	}
+
+	ossConfig := getOSSConfig()
+	workers := getWorkers()
+	totalStart := time.Now()
+
+	// 初始化 MySQL
+	if !*flagNoMySQL {
+		if _, err := storage.GetMySQLClient(); err != nil {
+			log.Printf("[警告] MySQL连接失败，涨跌停价格将为0: %v", err)
+		} else {
+			defer storage.CloseMySQL()
+		}
+	}
+
+	// 初始化下载器
+	downloader := dataconv.NewDownloader(
+		*flagAria2URL,
+		*flagAria2Token,
+		*flagFileServerURL,
+		*flagFileServerAuth,
+		*flagFileServerUser,
+		*flagFileServerPassHash,
+		*flagDownloadDir,
+		*flagKeepRaw,
+		time.Duration(*flagDownloadTimeout)*time.Minute,
+	)
+
+	if err := os.MkdirAll(*flagOutputDir, 0755); err != nil {
+		log.Fatalf("创建输出目录失败: %v", err)
+	}
+
+	log.Println("========================================")
+	log.Printf("[月模式] 共 %d 天: %s ~ %s",
+		len(dates), dates[0].Format("2006-01-02"), dates[len(dates)-1].Format("2006-01-02"))
+
+	// ---- 阶段1: OSS 预检，分类每天的处理策略 ----
+	type dayPlan struct {
+		date          time.Time
+		needProcess   bool   // 需要下载+完整处理
+		needDailyOnly bool   // 只需补 daily_basic
+	}
+
+	plans := make([]dayPlan, 0, len(dates))
+	var uploader *dataconv.OSSUploader
+	if *flagOSS && ossConfig != nil {
+		uploader, _ = dataconv.NewOSSUploader(*ossConfig)
+	}
+
+	for _, date := range dates {
+		if uploader != nil && !*flagDailyBasicSkipOSS {
+			tradeExist := uploader.TradeDataFilesExist(date)
+			dailyBasicExist := !*flagDailyBasic || uploader.ObjectExists(
+				uploader.BuildFilePath(date, date.Format("20060102")+"_daily_basic_data.parquet"),
+			)
+			if tradeExist && dailyBasicExist {
+				log.Printf("[跳过] %s 所有文件已在 OSS", date.Format("2006-01-02"))
+				continue
+			}
+			if tradeExist && !dailyBasicExist {
+				log.Printf("[补充] %s 仅补 daily_basic", date.Format("2006-01-02"))
+				plans = append(plans, dayPlan{date: date, needDailyOnly: true})
+				continue
+			}
+		}
+		plans = append(plans, dayPlan{date: date, needProcess: true})
+	}
+
+	log.Printf("[月模式] 需完整处理: %d 天，仅补daily_basic: %d 天",
+		func() int { n := 0; for _, p := range plans { if p.needProcess { n++ } }; return n }(),
+		func() int { n := 0; for _, p := range plans { if p.needDailyOnly { n++ } }; return n }(),
+	)
+
+	// ---- 阶段2: 先补 daily_basic（不需要下载）----
+	for _, plan := range plans {
+		if !plan.needDailyOnly {
+			continue
+		}
+		log.Printf("[daily_basic] 补生成 %s...", plan.date.Format("2006-01-02"))
+		n, err := dataconv.GenerateDailyBasicData(dataconv.DailyBasicConfig{
+			TradingDay: plan.date,
+			OutputDir:  *flagOutputDir,
+			OSSConfig:  ossConfig,
+			ForceRegen: *flagDailyBasicForce,
+		})
+		if err != nil {
+			log.Printf("[daily_basic] %s 失败: %v", plan.date.Format("2006-01-02"), err)
+		} else {
+			log.Printf("[daily_basic] %s 成功生成 %d 个文件", plan.date.Format("2006-01-02"), n)
+		}
+	}
+
+	// ---- 阶段3: 对需要完整处理的天，提交所有文件到 aria2 ----
+	type dayJobs struct {
+		date time.Time
+		jobs []struct {
+			task          dataconv.DownloadTask
+			gid           string
+			alreadyExists bool
+		}
+	}
+
+	allDayJobs := make([]dayJobs, 0)
+
+	for _, plan := range plans {
+		if !plan.needProcess {
+			continue
+		}
+		date := plan.date
+
+		// 列出该天文件
+		files, err := downloader.ListDayFiles(date)
+		if err != nil {
+			log.Printf("[错误] %s 列出文件失败: %v", date.Format("2006-01-02"), err)
+			continue
+		}
+		tasks := downloader.FilterAndSortFiles(files, date, *flagMarket, *flagDataType)
+		if len(tasks) == 0 {
+			log.Printf("[警告] %s 没有需要处理的文件", date.Format("2006-01-02"))
+			continue
+		}
+
+		dj := dayJobs{date: date}
+		for _, task := range tasks {
+			// 已存在则不重复下载
+			if stat, err := os.Stat(task.LocalPath); err == nil && stat.Size() > 0 {
+				log.Printf("[已存在] %s %s (%.1fMB)",
+					date.Format("20060102"), task.File.Name, float64(stat.Size())/1024/1024)
+				dj.jobs = append(dj.jobs, struct {
+					task          dataconv.DownloadTask
+					gid           string
+					alreadyExists bool
+				}{task, "exists", true})
+				continue
+			}
+			gid, _, err := downloader.SubmitDownload(task)
+			if err != nil {
+				log.Printf("[错误] %s 提交下载失败 %s: %v", date.Format("20060102"), task.File.Name, err)
+				continue
+			}
+			log.Printf("[下载] %s 已提交 %s (gid=%s)", date.Format("20060102"), task.File.Name, gid)
+			dj.jobs = append(dj.jobs, struct {
+				task          dataconv.DownloadTask
+				gid           string
+				alreadyExists bool
+			}{task, gid, false})
+		}
+		if len(dj.jobs) > 0 {
+			allDayJobs = append(allDayJobs, dj)
+		}
+	}
+
+	log.Printf("[月模式] 所有下载任务已提交，开始逐天处理...")
+	log.Println("========================================")
+
+	// ---- 阶段4: 逐天等待下载完成 → 处理 → 清理 ----
+	var successDays, failedDays int
+	for _, dj := range allDayJobs {
+		date := dj.date
+		dayStart := time.Now()
+		log.Println("========================================")
+		log.Printf("[处理] %s 等待文件下载完成...", date.Format("2006-01-02"))
+
+		// 等待该天所有文件下载完成
+		hasError := false
+		for _, job := range dj.jobs {
+			if job.alreadyExists {
+				continue
+			}
+			if err := downloader.WaitForDownload(job.gid, job.task.LocalPath); err != nil {
+				log.Printf("[错误] %s 下载失败 %s: %v", date.Format("20060102"), job.task.File.Name, err)
+				hasError = true
+			}
+		}
+		if hasError {
+			log.Printf("[错误] %s 部分文件下载失败，跳过处理", date.Format("2006-01-02"))
+			failedDays++
+			continue
+		}
+
+		// 构建 zipFiles map
+		zipFiles := make(map[string][]string)
+		for _, job := range dj.jobs {
+			name := job.task.File.Name
+			switch {
+			case strings.HasSuffix(name, "_mdl_4_24_0.csv.zip"):
+				zipFiles["sh_orderdeal"] = append(zipFiles["sh_orderdeal"], job.task.LocalPath)
+			case strings.HasSuffix(name, "_MarketData.csv.zip"):
+				zipFiles["sh_tick"] = append(zipFiles["sh_tick"], job.task.LocalPath)
+			case strings.HasSuffix(name, "_mdl_6_33_0.csv.zip"):
+				zipFiles["sz_order"] = append(zipFiles["sz_order"], job.task.LocalPath)
+			case strings.HasSuffix(name, "_mdl_6_36_0.csv.zip"):
+				zipFiles["sz_deal"] = append(zipFiles["sz_deal"], job.task.LocalPath)
+			case strings.HasSuffix(name, "_mdl_6_28_0.csv.zip"):
+				zipFiles["sz_tick"] = append(zipFiles["sz_tick"], job.task.LocalPath)
+			}
+		}
+
+		// 创建处理器
+		processor, err := dataconv.NewProcessor(dataconv.ProcessorConfig{
+			TradingDay:  date,
+			OutputDir:   *flagOutputDir,
+			Workers:     workers,
+			ZipPassword: *flagPassword,
+			RowLimit:    *flagLimit,
+			Optimize:    *flagOptimize,
+			ForceInt32:  *flagForceInt32,
+			OSSConfig:   ossConfig,
+		})
+		if err != nil {
+			log.Printf("[错误] %s 创建处理器失败: %v", date.Format("2006-01-02"), err)
+			failedDays++
+			continue
+		}
+
+		// 处理
+		if err := processor.ProcessAllInMemory(zipFiles); err != nil {
+			log.Printf("[错误] %s 处理失败: %v", date.Format("2006-01-02"), err)
+			failedDays++
+			continue
+		}
+
+		// 生成 daily basic data
+		if *flagDailyBasic {
+			log.Printf("[daily_basic] 生成 %s...", date.Format("2006-01-02"))
+			n, err := dataconv.GenerateDailyBasicData(dataconv.DailyBasicConfig{
+				TradingDay: date,
+				OutputDir:  *flagOutputDir,
+				OSSConfig:  ossConfig,
+				ForceRegen: *flagDailyBasicForce,
+			})
+			if err != nil {
+				log.Printf("[daily_basic] %s 失败: %v", date.Format("2006-01-02"), err)
+			} else {
+				log.Printf("[daily_basic] %s 成功生成 %d 个文件", date.Format("2006-01-02"), n)
+			}
+		}
+
+		// 清理原始 ZIP
+		if !*flagKeepRaw {
+			for _, job := range dj.jobs {
+				_ = downloader.CleanupFile(job.task.LocalPath)
+			}
+		}
+
+		// 清理本地 Parquet
+		if *flagOSS && *flagOSSCleanLocal {
+			cleanLocalParquetFiles(*flagOutputDir, date)
+		}
+
+		successDays++
+		log.Printf("[完成] %s 耗时 %v", date.Format("2006-01-02"), time.Since(dayStart))
+	}
+
+	log.Println("========================================")
+	log.Printf("[月模式] 完成 %d-%02d: 成功 %d 天，失败 %d 天，总耗时 %v",
+		*flagYear, *flagMonth, successDays, failedDays, time.Since(totalStart))
 }
 
 func runBatchMode() {
@@ -259,9 +530,9 @@ func processSingleDay(date time.Time, downloader *dataconv.Downloader) error {
 
 	// 0. OSS 预检：根据结果文件是否存在决定跳过策略
 	//
-	//   情况A：order/deal/tick 全在 OSS，daily_basic 也在（或未开启）→ 整天跳过
-	//   情况B：order/deal/tick 全在 OSS，仅 daily_basic 缺失            → 跳过下载，只补跑 SQL
-	//   情况C：order/deal/tick 有缺失                                   → 走完整下载+处理流程
+	//   情况A：4个文件全在 OSS                          → 跳过（-resort 时执行重排序）
+	//   情况B：order/deal/tick 全在，仅 daily_basic 缺失 → 跳过下载，只补 daily_basic
+	//   情况C：order/deal/tick 有缺失                    → 走完整下载+处理流程
 	if *flagOSS && !*flagDailyBasicSkipOSS {
 		ossConfig := getOSSConfig()
 		if ossConfig != nil {
@@ -272,8 +543,35 @@ func processSingleDay(date time.Time, downloader *dataconv.Downloader) error {
 				)
 
 				if tradeExist && dailyBasicExist {
-					// 情况A：全部存在，整天跳过
-					log.Printf("[跳过] %s 所有结果文件已在 OSS，跳过", date.Format("2006-01-02"))
+					// 情况A：全部存在
+					if *flagResort && *flagOptimize {
+						log.Println("========================================")
+						log.Printf("[重排序] %s 所有文件已在 OSS，执行重排序...", date.Format("2006-01-02"))
+						log.Println("========================================")
+						workers := getWorkers()
+						processor, perr := dataconv.NewProcessor(dataconv.ProcessorConfig{
+							TradingDay:  date,
+							OutputDir:   *flagOutputDir,
+							Workers:     workers,
+							ZipPassword: *flagPassword,
+							Optimize:    true,
+							OSSConfig:   ossConfig,
+						})
+						if perr != nil {
+							return fmt.Errorf("创建处理器失败: %w", perr)
+						}
+						tmpDir := filepath.Join(*flagOutputDir, ".resort_tmp", date.Format("20060102"))
+						if err := os.MkdirAll(tmpDir, 0755); err != nil {
+							return fmt.Errorf("创建临时目录失败: %w", err)
+						}
+						defer os.RemoveAll(tmpDir)
+						if err := processor.ResortFromOSS(date, tmpDir); err != nil {
+							return fmt.Errorf("重排序失败: %w", err)
+						}
+						log.Printf("[完成] %s 重排序完成，耗时: %v", date.Format("2006-01-02"), time.Since(dayStart))
+					} else {
+						log.Printf("[跳过] %s 所有结果文件已在 OSS，跳过", date.Format("2006-01-02"))
+					}
 					return nil
 				}
 
@@ -647,6 +945,28 @@ func runSingleDayMode() {
 
 		if err := processor.ProcessAllInMemory(zipFiles); err != nil {
 			log.Fatalf("全量内存处理失败: %v", err)
+		}
+
+		// 生成 daily basic data
+		if *flagDailyBasic {
+			log.Printf("[daily_basic] 开始生成 %s 的每日基础数据...", tradingDay.Format("2006-01-02"))
+			n, err := dataconv.GenerateDailyBasicData(dataconv.DailyBasicConfig{
+				TradingDay: tradingDay,
+				OutputDir:  outputDir,
+				OSSConfig:  ossConfig,
+				ForceRegen: *flagDailyBasicForce,
+			})
+			if err != nil {
+				log.Printf("[daily_basic] 生成失败: %v", err)
+			} else {
+				log.Printf("[daily_basic] 成功生成 %d 个文件 ✓", n)
+			}
+		}
+
+		// OSS上传后清理本地 Parquet
+		if *flagOSS && *flagOSSCleanLocal {
+			log.Printf("[清理] 删除本地Parquet文件...")
+			cleanLocalParquetFiles(outputDir, tradingDay)
 		}
 
 		log.Println("========================================")

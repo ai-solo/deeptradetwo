@@ -2,8 +2,10 @@ package dataconv
 
 import (
 	"fmt"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -371,6 +373,216 @@ func (c *Converter) ConvertSHTickFast(header []string, rows [][]string, priceCac
 		fmt.Printf("[统计] 上交所快照跳过 %d 条无效 SecurityID\n", skipped)
 	}
 	return ticks, nil
+}
+
+// ========== 并发转换辅助 ==========
+
+// splitRows 将 rows 均匀切分为 n 份
+func splitRows(rows [][]string, n int) [][][]string {
+	if n <= 1 || len(rows) <= n {
+		return [][][]string{rows}
+	}
+	chunks := make([][][]string, n)
+	size := (len(rows) + n - 1) / n
+	for i := 0; i < n; i++ {
+		start := i * size
+		if start >= len(rows) {
+			break
+		}
+		end := start + size
+		if end > len(rows) {
+			end = len(rows)
+		}
+		chunks[i] = rows[start:end]
+	}
+	return chunks
+}
+
+// parallelWorkers 返回并发数（最多 GOMAXPROCS，至少 1）
+func parallelWorkers() int {
+	n := runtime.GOMAXPROCS(0)
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
+// ConvertSZOrderParallel 并发版深交所委托转换
+func (c *Converter) ConvertSZOrderParallel(header []string, rows [][]string) ([]Order, error) {
+	n := parallelWorkers()
+	chunks := splitRows(rows, n)
+	results := make([][]Order, len(chunks))
+	errs := make([]error, len(chunks))
+	var wg sync.WaitGroup
+	for i, chunk := range chunks {
+		if chunk == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(i int, chunk [][]string) {
+			defer wg.Done()
+			results[i], errs[i] = c.ConvertSZOrderFast(header, chunk)
+		}(i, chunk)
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return nil, err
+		}
+	}
+	total := 0
+	for _, r := range results {
+		total += len(r)
+	}
+	out := make([]Order, 0, total)
+	for _, r := range results {
+		out = append(out, r...)
+	}
+	return out, nil
+}
+
+// ConvertSZDealParallel 并发版深交所成交转换
+func (c *Converter) ConvertSZDealParallel(header []string, rows [][]string) ([]Deal, error) {
+	n := parallelWorkers()
+	chunks := splitRows(rows, n)
+	results := make([][]Deal, len(chunks))
+	errs := make([]error, len(chunks))
+	var wg sync.WaitGroup
+	for i, chunk := range chunks {
+		if chunk == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(i int, chunk [][]string) {
+			defer wg.Done()
+			results[i], errs[i] = c.ConvertSZDealFast(header, chunk)
+		}(i, chunk)
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return nil, err
+		}
+	}
+	total := 0
+	for _, r := range results {
+		total += len(r)
+	}
+	out := make([]Deal, 0, total)
+	for _, r := range results {
+		out = append(out, r...)
+	}
+	return out, nil
+}
+
+// ConvertSZTickParallel 并发版深交所快照转换
+func (c *Converter) ConvertSZTickParallel(header []string, rows [][]string, priceCache *PriceCache) ([]Tick, error) {
+	n := parallelWorkers()
+	chunks := splitRows(rows, n)
+	results := make([][]Tick, len(chunks))
+	errs := make([]error, len(chunks))
+	var wg sync.WaitGroup
+	for i, chunk := range chunks {
+		if chunk == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(i int, chunk [][]string) {
+			defer wg.Done()
+			results[i], errs[i] = c.ConvertSZTickFast(header, chunk, priceCache)
+		}(i, chunk)
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return nil, err
+		}
+	}
+	total := 0
+	for _, r := range results {
+		total += len(r)
+	}
+	out := make([]Tick, 0, total)
+	for _, r := range results {
+		out = append(out, r...)
+	}
+	return out, nil
+}
+
+// ConvertSHOrderDealParallel 并发版上交所委托成交转换
+func (c *Converter) ConvertSHOrderDealParallel(header []string, rows [][]string) ([]Order, []Deal, error) {
+	n := parallelWorkers()
+	chunks := splitRows(rows, n)
+	type result struct {
+		orders []Order
+		deals  []Deal
+		err    error
+	}
+	results := make([]result, len(chunks))
+	var wg sync.WaitGroup
+	for i, chunk := range chunks {
+		if chunk == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(i int, chunk [][]string) {
+			defer wg.Done()
+			o, d, err := c.ConvertSHOrderDealFast(header, chunk)
+			results[i] = result{o, d, err}
+		}(i, chunk)
+	}
+	wg.Wait()
+	for _, r := range results {
+		if r.err != nil {
+			return nil, nil, r.err
+		}
+	}
+	totalO, totalD := 0, 0
+	for _, r := range results {
+		totalO += len(r.orders)
+		totalD += len(r.deals)
+	}
+	orders := make([]Order, 0, totalO)
+	deals := make([]Deal, 0, totalD)
+	for _, r := range results {
+		orders = append(orders, r.orders...)
+		deals = append(deals, r.deals...)
+	}
+	return orders, deals, nil
+}
+
+// ConvertSHTickParallel 并发版上交所快照转换
+func (c *Converter) ConvertSHTickParallel(header []string, rows [][]string, priceCache *PriceCache) ([]Tick, error) {
+	n := parallelWorkers()
+	chunks := splitRows(rows, n)
+	results := make([][]Tick, len(chunks))
+	errs := make([]error, len(chunks))
+	var wg sync.WaitGroup
+	for i, chunk := range chunks {
+		if chunk == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(i int, chunk [][]string) {
+			defer wg.Done()
+			results[i], errs[i] = c.ConvertSHTickFast(header, chunk, priceCache)
+		}(i, chunk)
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return nil, err
+		}
+	}
+	total := 0
+	for _, r := range results {
+		total += len(r)
+	}
+	out := make([]Tick, 0, total)
+	for _, r := range results {
+		out = append(out, r...)
+	}
+	return out, nil
 }
 
 // parseTimeQuick 快速解析时间（已知格式，避免循环尝试）

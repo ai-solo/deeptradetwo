@@ -39,15 +39,18 @@ func (p *Processor) ProcessAllInMemory(zipFiles map[string][]string) error {
 		for _, path := range paths {
 			path := path
 			tasks = append(tasks, func() readResult {
+				t0 := time.Now()
 				log.Printf("[内存处理] 读取深交所委托: %s", path)
 				header, rows, err := p.reader.ReadAll(path, readOpts)
 				if err != nil {
 					return readResult{err: fmt.Errorf("读取深交所委托失败: %w", err), label: path}
 				}
-				log.Printf("[内存处理] 深交所委托 %d 行，开始转换...", len(rows))
-				orders, err := p.converter.ConvertSZOrderFast(header, rows)
+				readDur := time.Since(t0)
+				log.Printf("[计时] 深交所委托读取 %d 行耗时 %v", len(rows), readDur)
+				t1 := time.Now()
+				orders, err := p.converter.ConvertSZOrderParallel(header, rows)
 				runtime.GC()
-				log.Printf("[内存处理] 深交所委托转换完成: %d 条", len(orders))
+				log.Printf("[计时] 深交所委托转换 %d 条耗时 %v", len(orders), time.Since(t1))
 				return readResult{orders: orders, err: err, label: path}
 			})
 		}
@@ -57,15 +60,17 @@ func (p *Processor) ProcessAllInMemory(zipFiles map[string][]string) error {
 		for _, path := range paths {
 			path := path
 			tasks = append(tasks, func() readResult {
+				t0 := time.Now()
 				log.Printf("[内存处理] 读取深交所成交: %s", path)
 				header, rows, err := p.reader.ReadAll(path, readOpts)
 				if err != nil {
 					return readResult{err: fmt.Errorf("读取深交所成交失败: %w", err), label: path}
 				}
-				log.Printf("[内存处理] 深交所成交 %d 行，开始转换...", len(rows))
-				deals, err := p.converter.ConvertSZDealFast(header, rows)
+				log.Printf("[计时] 深交所成交读取 %d 行耗时 %v", len(rows), time.Since(t0))
+				t1 := time.Now()
+				deals, err := p.converter.ConvertSZDealParallel(header, rows)
 				runtime.GC()
-				log.Printf("[内存处理] 深交所成交转换完成: %d 条", len(deals))
+				log.Printf("[计时] 深交所成交转换 %d 条耗时 %v", len(deals), time.Since(t1))
 				return readResult{deals: deals, err: err, label: path}
 			})
 		}
@@ -75,15 +80,17 @@ func (p *Processor) ProcessAllInMemory(zipFiles map[string][]string) error {
 		for _, path := range paths {
 			path := path
 			tasks = append(tasks, func() readResult {
+				t0 := time.Now()
 				log.Printf("[内存处理] 读取深交所快照: %s", path)
 				header, rows, err := p.reader.ReadAll(path, readOpts)
 				if err != nil {
 					return readResult{err: fmt.Errorf("读取深交所快照失败: %w", err), label: path}
 				}
-				log.Printf("[内存处理] 深交所快照 %d 行，开始转换...", len(rows))
-				ticks, err := p.converter.ConvertSZTickFast(header, rows, p.priceCache)
+				log.Printf("[计时] 深交所快照读取 %d 行耗时 %v", len(rows), time.Since(t0))
+				t1 := time.Now()
+				ticks, err := p.converter.ConvertSZTickParallel(header, rows, p.priceCache)
 				runtime.GC()
-				log.Printf("[内存处理] 深交所快照转换完成: %d 条", len(ticks))
+				log.Printf("[计时] 深交所快照转换 %d 条耗时 %v", len(ticks), time.Since(t1))
 				return readResult{ticks: ticks, err: err, label: path}
 			})
 		}
@@ -93,15 +100,17 @@ func (p *Processor) ProcessAllInMemory(zipFiles map[string][]string) error {
 		for _, path := range paths {
 			path := path
 			tasks = append(tasks, func() readResult {
+				t0 := time.Now()
 				log.Printf("[内存处理] 读取上交所委托+成交: %s", path)
 				header, rows, err := p.reader.ReadAll(path, readOpts)
 				if err != nil {
 					return readResult{err: fmt.Errorf("读取上交所委托+成交失败: %w", err), label: path}
 				}
-				log.Printf("[内存处理] 上交所委托+成交 %d 行，开始转换...", len(rows))
-				orders, deals, err := p.converter.ConvertSHOrderDealFast(header, rows)
+				log.Printf("[计时] 上交所委托+成交读取 %d 行耗时 %v", len(rows), time.Since(t0))
+				t1 := time.Now()
+				orders, deals, err := p.converter.ConvertSHOrderDealParallel(header, rows)
 				runtime.GC()
-				log.Printf("[内存处理] 上交所委托+成交转换完成: orders=%d deals=%d", len(orders), len(deals))
+				log.Printf("[计时] 上交所委托+成交转换 orders=%d deals=%d 耗时 %v", len(orders), len(deals), time.Since(t1))
 				return readResult{orders: orders, deals: deals, err: err, label: path}
 			})
 		}
@@ -111,15 +120,17 @@ func (p *Processor) ProcessAllInMemory(zipFiles map[string][]string) error {
 		for _, path := range paths {
 			path := path
 			tasks = append(tasks, func() readResult {
+				t0 := time.Now()
 				log.Printf("[内存处理] 读取上交所快照: %s", path)
 				header, rows, err := p.reader.ReadAll(path, readOpts)
 				if err != nil {
 					return readResult{err: fmt.Errorf("读取上交所快照失败: %w", err), label: path}
 				}
-				log.Printf("[内存处理] 上交所快照 %d 行，开始转换...", len(rows))
-				ticks, err := p.converter.ConvertSHTickFast(header, rows, p.priceCache)
+				log.Printf("[计时] 上交所快照读取 %d 行耗时 %v", len(rows), time.Since(t0))
+				t1 := time.Now()
+				ticks, err := p.converter.ConvertSHTickParallel(header, rows, p.priceCache)
 				runtime.GC()
-				log.Printf("[内存处理] 上交所快照转换完成: %d 条", len(ticks))
+				log.Printf("[计时] 上交所快照转换 %d 条耗时 %v", len(ticks), time.Since(t1))
 				return readResult{ticks: ticks, err: err, label: path}
 			})
 		}
