@@ -125,30 +125,19 @@ func (p *Processor) ProcessAllInMemory(zipFiles map[string][]string) error {
 		}
 	}
 
-	// 并发执行所有任务
-	results := make([]readResult, len(tasks))
-	var wg sync.WaitGroup
-	for i, task := range tasks {
-		wg.Add(1)
-		i, task := i, task
-		go func() {
-			defer wg.Done()
-			results[i] = task()
-		}()
-	}
-	wg.Wait()
-
-	// 合并结果，检查错误
+	// 串行执行所有任务（避免并发读取导致内存峰值过高）
 	var allOrders []Order
 	var allDeals []Deal
 	var allTicks []Tick
-	for _, r := range results {
+	for _, task := range tasks {
+		r := task()
 		if r.err != nil {
 			return r.err
 		}
 		allOrders = append(allOrders, r.orders...)
 		allDeals = append(allDeals, r.deals...)
 		allTicks = append(allTicks, r.ticks...)
+		runtime.GC()
 	}
 
 	// ---- 并发排序 Code + SeqNum ----
