@@ -282,8 +282,6 @@ func (c *Converter) ConvertSHOrderDealFast(header []string, rows [][]string) ([]
 			case "S":
 				side = 1
 			}
-			price := idx.f64(row, "Price")
-			vol := idx.f64(row, "Qty")
 			deals = append(deals, Deal{
 				TradingDay:  c.tradingDay,
 				Code:        code,
@@ -292,9 +290,9 @@ func (c *Converter) ConvertSHOrderDealFast(header []string, rows [][]string) ([]
 				SaleOrderID: idx.i64(row, "SellOrderNO"),
 				BuyOrderID:  idx.i64(row, "BuyOrderNO"),
 				Side:        side,
-				Price:       price,
-				Volume:      vol,
-				Money:       price * vol,
+				Price:       idx.f64(row, "Price"),
+				Volume:      idx.f64(row, "Qty"),
+				Money:       idx.f64(row, "TradeMoney"),
 				Channel:     channel,
 				SeqNum:      seqNum,
 			})
