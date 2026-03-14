@@ -636,12 +636,10 @@ func runSingleDayMode() {
 				}
 			}
 			if dataType == "all" || dataType == "tick" {
-				for _, suffix := range []string{"_mdl_6_28_0.csv.zip", "_mdl_6_28_1.csv.zip", "_mdl_6_28_2.csv.zip"} {
-					if p := findDataFile(dataDir, datePath, datePrefix+suffix); p != "" {
-						zipFiles["sz_tick"] = append(zipFiles["sz_tick"], p)
-					}
-				}
-				if len(zipFiles["sz_tick"]) == 0 {
+				// 只取 _mdl_6_28_0，_mdl_6_28_1/_2 是 OrderQueue 档位数据，格式不同
+				if p := findDataFile(dataDir, datePath, datePrefix+"_mdl_6_28_0.csv.zip"); p != "" {
+					zipFiles["sz_tick"] = append(zipFiles["sz_tick"], p)
+				} else {
 					log.Printf("[警告] 找不到深交所快照文件")
 				}
 			}
