@@ -66,7 +66,7 @@ func (d *Downloader) FilterAndSortFiles(files []fileserver.FileInfo, date time.T
 		task := DownloadTask{
 			File:        file,
 			DownloadURL: d.fileServerClient.BuildDownloadURL(file.Path, file.Sign),
-			LocalPath:   filepath.Join(d.downloadDir, dateStr, name),
+			LocalPath:   filepath.Join(d.downloadDir, date.Format("2006.01"), dateStr, name),
 		}
 
 		// Index 文件（最高优先级）
